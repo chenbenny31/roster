@@ -59,11 +59,12 @@ available. The scheduler blocks a job rather than evicting a running one.
 ## Architecture
 
 - **Daemon** — tokio async runtime, Unix socket IPC, graceful SIGTERM shutdown
-- **IPC** — newline-delimited JSON over `~/.local/run/roster.sock`
+- **IPC** — newline-delimited JSON over `$XDG_RUNTIME_DIR/roster.sock` (falls back to `~/.local/run/roster.sock`)
 - **Scheduler** — Kahn's algorithm for topological ordering, resource accounting
 - **Executor** — shell command executor; captures stdout/stderr to disk
 - **Storage** — SQLite for run/job metadata; log files written directly, no daemon involvement
 - **Resource discovery** — sysinfo (CPU/RAM), nvml (per-GPU VRAM)
+- **Resource accounting** — user-declared; scheduler holds declared CPU/memory/VRAM in reserve for the job's lifetime
 
 ## Non-goals
 
@@ -75,3 +76,7 @@ available. The scheduler blocks a job rather than evicting a running one.
 ## Status
 
 Under active development. API and wire protocol unstable.
+
+## License
+
+GPL-3.0

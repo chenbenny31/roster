@@ -42,7 +42,12 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Daemon => { unimplemented!("daemon") },
         Command::Submit { .. } => { unimplemented!("submit") },
-        Command::Ps => { unimplemented!("ps") },
+        Command::Ps => {
+            let response = roster::ipc::client::send(
+                roster::ipc::protocol::Request::Ps
+            ).await?;
+            println!("{:?}", response);
+        },
         Command::Status { .. } => { unimplemented!("status") },
         Command::Logs { .. } => { unimplemented!("logs") },
         Command::Cancel { .. } => { unimplemented!("cancel") },
