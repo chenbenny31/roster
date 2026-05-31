@@ -40,7 +40,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Daemon => { unimplemented!("daemon") },
+        Command::Daemon => {
+            let state = roster::daemon::DaemonState::new();
+            roster::daemon::run(state).await?;
+        },
         Command::Submit { .. } => { unimplemented!("submit") },
         Command::Ps => {
             let response = roster::ipc::client::send(

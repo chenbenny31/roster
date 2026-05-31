@@ -2,7 +2,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UnixStream;
 
 use crate::ipc::protocol::{Request, Response};
-use crate::ipc::socket_path;
+use crate::paths::socket_path;
 
 /// Send one request to the daemon and return the response
 /// Connection is closed on drop after response is read
