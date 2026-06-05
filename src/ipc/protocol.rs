@@ -6,11 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::workflow::model::{JobState, RunState};
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum Request {
     Ping,
-    Submit { file: String },
+    Submit { spec_yaml: String }, // client read file and send content
     Ps,
     Status { run_id: String },
     Logs { job_id: String },
@@ -41,24 +43,6 @@ pub struct RunDetail {
     pub run_id: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub enum RunState {
-    Pending,
-    Running,
-    Succeeded,
-    Failed,
-    Canceled,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub enum JobState {
-    Pending,
-    Running,
-    Succeeded,
-    Failed,
-    Canceled,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,9 +65,9 @@ mod tests {
 
     #[test]
     fn submit_round_trip() {
-        let req = Request::Submit { file: "/tmp/w.yaml".into() };
-        let Request::Submit { file } = round_trip_request(req) else { panic!() };
-        assert_eq!(file, "/tmp/w.yaml");
+        let req = Request::Submit { spec_yaml: "name: test\njobs: []".into() };
+        let Request::Submit { spec_yaml } = round_trip_request(req) else { panic!() };
+        assert_eq!(spec_yaml, "name: test\njobs: []");
     }
 
     #[test]
