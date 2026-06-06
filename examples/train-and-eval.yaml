@@ -1,0 +1,23 @@
+name: train-and-eval
+jobs:
+  - id: preprocess
+    command: python preprocess.py
+    resources:
+      cpu: 4
+      memory_mb: 4096
+
+  - id: train
+    depends_on: [preprocess]
+    command: python train.py
+    resources:
+      cpu: 8
+      gpu: 0
+      vram_mb: 12000
+
+  - id: eval
+    depends_on: [train]
+    command: python eval.py
+    resources:
+      cpu: 2
+      gpu: 0
+      vram_mb: 4000

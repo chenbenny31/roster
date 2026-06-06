@@ -7,6 +7,9 @@ use tokio::time::timeout;
 
 use crate::daemon::DaemonState;
 use crate::ipc::protocol::{Request, Response};
+use crate::workflow::dag;
+use crate::workflow::model::WorkflowRun;
+use crate::workflow::spec;
 
 /// Handle one connection: read one req, dispatch, write one res, close
 pub async fn handle_connection(mut socket: UnixStream, state: Arc<DaemonState>) {
@@ -56,11 +59,30 @@ where
     }
 }
 
+async fn handle_submit(spec_yaml: String, state: Arc<DaemonState>) -> Response {
+    let spec = match spec::parse(&spec_yaml) {
+        Ok(spec) => spec,
+        Err(error) => return Response::Error { message: format!("yaml parse error: {}", error) },
+    };
+
+    let topo_order = match dag::validate(&spec) {
+        Ok(order) => order,
+        Err(error) => return Response::Error { message: format!("dag error: {}", error) },
+    };
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let run = WorkflowRun::new(run_id.clone(), spec, topo_order);
+
+    state.runs.lock().await.insert(run_id.clone(), run);
+
+    Response::Submitted { run_id }
+}
+
 /// Dispatch a parsed request to appropriate handler
-async fn dispatch(request: Request, _state: Arc<DaemonState>) -> Response {
+async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
     match request {
         Request::Ping => Response::Pong,
-        Request::Submit { .. } => Response::Error { message: "not implemented".into() },
+        Request::Submit { spec_yaml } => handle_submit(spec_yaml, state).await,
         Request::Ps => Response::Error { message: "not implemented".into() },
         Request::Status { .. } => Response::Error { message: "not implemented".into() },
         Request::Logs { .. } => Response::Error { message: "not implemented".into() },

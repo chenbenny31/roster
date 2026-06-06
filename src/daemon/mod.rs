@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -5,19 +6,25 @@ use std::sync::Arc; // atomic reference counting for shared ownership across thr
 
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 
 use crate::error::RosterError;
 use crate::ipc::server::handle_connection;
 use crate::paths::{pid_path, socket_path};
+use crate::workflow::model::WorkflowRun;
 
 /// Shared daemon state, accessed behind Arch<DaemonState>
-pub struct DaemonState {}
+pub struct DaemonState {
+    pub runs: Mutex<HashMap<String, WorkflowRun>>, // run_id: WorkflowRun
+}
 
 impl DaemonState {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {})
+        Arc::new(Self {
+            runs: Mutex::new(HashMap::new()),
+        })
     }
 }
 
@@ -49,7 +56,7 @@ fn check_not_running() -> Result<(), RosterError> {
 
     // kill (pid, 0) checks if proc exists (no signal)
     let pid = nix::unistd::Pid::from_raw(pid as i32);
-    match nix::sys::signal::kill(pid, None) {
+    match nix::sys::signal::kill(pid, None) { // kill(pid, 0) existence check no signal
         Ok(_) => Err(RosterError::AlreadyRunning(pid.as_raw() as u32)),
         Err(_) => Ok(()), // proc gone, stale PID file
     }

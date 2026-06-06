@@ -44,7 +44,14 @@ async fn main() -> anyhow::Result<()> {
             let state = roster::daemon::DaemonState::new();
             roster::daemon::run(state).await?;
         },
-        Command::Submit { .. } => { unimplemented!("submit") },
+        Command::Submit { file } => {
+            let spec_yaml = tokio::fs::read_to_string(&file).await
+                .map_err(|error| anyhow::anyhow!("failed to read {}: {}", file, error))?;
+            let response = roster::ipc::client::send(
+                roster::ipc::protocol::Request::Submit { spec_yaml }
+            ).await?;
+            println!("{:?}", response);
+        },
         Command::Ps => {
             let response = roster::ipc::client::send(
                 roster::ipc::protocol::Request::Ps
