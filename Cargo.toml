@@ -7,6 +7,9 @@ edition = "2021"
 name = "roster"
 path = "src/main.rs"
 
+[features]
+nvml = []
+
 [dependencies]
 anyhow = "1"
 libc = "0.2"
