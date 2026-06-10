@@ -11,7 +11,7 @@ jobs:
     command: python train.py
     resources:
       cpu: 8
-      gpu: 0
+      gpu: 1
       vram_mb: 12000
 
   - id: eval
@@ -19,5 +19,5 @@ jobs:
     command: python eval.py
     resources:
       cpu: 2
-      gpu: 0
+      gpu: 1
       vram_mb: 4000

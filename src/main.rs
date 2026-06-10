@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
 
+use roster::resource::discovery;
+use roster::resource::pool::ResourcePool;
+
 #[derive(Parser)]
 #[command(name = "roster", about = "GPU-aware single-node workflow scheduler")]
 struct Cli {
@@ -41,7 +44,9 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Daemon => {
-            let state = roster::daemon::DaemonState::new();
+            let resources = discovery::discover();
+            let pool = ResourcePool::new(resources);
+            let state = roster::daemon::DaemonState::new(pool);
             roster::daemon::run(state).await?;
         },
         Command::Submit { file } => {

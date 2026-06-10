@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
 
 use crate::workflow::spec::{JobSpec, WorkflowSpec};
+use crate::resource::pool::Allocation;
 
 /// Run level state, mirrors JobState but no Skipped/Interrupted
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -52,6 +53,7 @@ pub struct JobRun {
     pub spec: JobSpec,
     pub state: JobState,
     pub pid: Option<u32>, // set when Running, cleared on termin
+    pub allocation: Option<Allocation>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub exit_code: Option<u32>,
@@ -65,6 +67,7 @@ impl JobRun {
             spec,
             state: JobState::Pending,
             pid: None,
+            allocation: None,
             started_at: None,
             ended_at: None,
             exit_code: None,

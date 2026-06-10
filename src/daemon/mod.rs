@@ -13,17 +13,20 @@ use tokio::time::{timeout, Duration};
 use crate::error::RosterError;
 use crate::ipc::server::handle_connection;
 use crate::paths::{pid_path, socket_path};
+use crate::resource::pool::ResourcePool;
 use crate::workflow::model::WorkflowRun;
 
 /// Shared daemon state, accessed behind Arch<DaemonState>
 pub struct DaemonState {
     pub runs: Mutex<HashMap<String, WorkflowRun>>, // run_id: WorkflowRun
+    pub pool: Mutex<ResourcePool>,
 }
 
 impl DaemonState {
-    pub fn new() -> Arc<Self> {
+    pub fn new(pool: ResourcePool) -> Arc<Self> {
         Arc::new(Self {
             runs: Mutex::new(HashMap::new()),
+            pool: Mutex::new(pool),
         })
     }
 }

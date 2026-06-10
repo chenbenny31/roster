@@ -29,8 +29,10 @@ pub struct ResourceSpec {
     #[serde(default = "default_memory_mb")]
     pub memory_mb: u64,
 
-    pub gpu: Option<u32>, // device index, None means CPU-only job
-    pub vram_mb: Option<u64>, // None means no VARM reservation
+    #[serde(default)]
+    pub gpu: u32, // number of GPUs requires, 0 = CPU-only
+    #[serde(default)]
+    pub vram_mb: u64, // per-GPU VRAM requirement in MB, 0 if no GPU
 }
 
 impl Default for ResourceSpec {
@@ -38,8 +40,8 @@ impl Default for ResourceSpec {
         Self {
             cpu: default_cpu(),
             memory_mb: default_memory_mb(),
-            gpu: None,
-            vram_mb: None,
+            gpu: 0,
+            vram_mb: 0,
         }
     }
 }
@@ -71,7 +73,7 @@ jobs:
     command: python train.py
     resources:
       cpu: 8
-      gpu: 0
+      gpu: 1
       vram_mb: 12000
 
   - id: eval
@@ -79,7 +81,7 @@ jobs:
     command: python eval.py
     resources:
       cpu: 2
-      gpu: 0
+      gpu: 1
       vram_mb: 4000
 "#;
 
@@ -107,14 +109,14 @@ jobs:
         let spec = parse(yaml).unwrap();
         assert_eq!(spec.jobs[0].resources.cpu, 1);
         assert_eq!(spec.jobs[0].resources.memory_mb, 512);
-        assert!(spec.jobs[0].resources.gpu.is_none());
+        assert_eq!(spec.jobs[0].resources.gpu, 0);
     }
 
     #[test]
     fn gpu_job_parses_correctly() {
         let spec = parse(EXAMPLE).unwrap();
         let train = &spec.jobs[1];
-        assert_eq!(train.resources.gpu, Some(0));
-        assert_eq!(train.resources.vram_mb, Some(12000));
+        assert_eq!(train.resources.gpu, 1);
+        assert_eq!(train.resources.vram_mb, 12000);
     }
 }
