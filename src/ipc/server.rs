@@ -65,13 +65,28 @@ async fn handle_submit(spec_yaml: String, state: Arc<DaemonState>) -> Response {
         Err(error) => return Response::Error { message: format!("yaml parse error: {}", error) },
     };
 
-    let topo_order = match dag::validate(&spec) {
-        Ok(order) => order,
-        Err(error) => return Response::Error { message: format!("dag error: {}", error) },
-    };
+
+    if let Err(error) = dag::validate(&spec) {
+        return Response::Error { message: format!("dag validate error: {}", error) };
+    }
+
+    // Fail fast if any job requires GPUs but none are available
+    {
+        let pool = state.pool.lock().await;
+        for job in &spec.jobs {
+            if job.resources.gpu > 0 && pool.total.gpus.is_empty() {
+                return Response::Error {
+                    message: format!(
+                        "job '{}' requires {} GPU(s) but this node has none",
+                        job.id, job.resources.gpu
+                    ),
+                };
+            }
+        }
+    } // lock released here before WorkflowRun created
 
     let run_id = uuid::Uuid::new_v4().to_string();
-    let run = WorkflowRun::new(run_id.clone(), spec, topo_order);
+    let run = WorkflowRun::new(run_id.clone(), spec);
 
     state.runs.lock().await.insert(run_id.clone(), run);
 

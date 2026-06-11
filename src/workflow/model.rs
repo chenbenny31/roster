@@ -54,6 +54,7 @@ pub struct JobRun {
     pub state: JobState,
     pub pid: Option<u32>, // set when Running, cleared on termin
     pub allocation: Option<Allocation>,
+    pub cancelling: bool, // set before killpg, prevents non-zero exit
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub exit_code: Option<u32>,
@@ -68,6 +69,7 @@ impl JobRun {
             state: JobState::Pending,
             pid: None,
             allocation: None,
+            cancelling: false,
             started_at: None,
             ended_at: None,
             exit_code: None,
@@ -82,13 +84,12 @@ pub struct WorkflowRun {
     pub run_id: String,
     pub workflow_name: String,
     pub spec: WorkflowSpec,
-    pub topo_order: Vec<String>, // flat topo order, computed at submit
     pub jobs: HashMap<String, JobRun>,
     pub created_at: DateTime<Utc>,
 }
 
 impl WorkflowRun {
-    pub fn new(run_id: String, spec: WorkflowSpec, topo_order: Vec<String>) -> Self {
+    pub fn new(run_id: String, spec: WorkflowSpec) -> Self {
         let jobs = spec.jobs
             .iter()
             .map(|job_spec| (job_spec.id.clone(), JobRun::new(job_spec.clone())))
@@ -100,7 +101,6 @@ impl WorkflowRun {
             run_id,
             workflow_name,
             spec,
-            topo_order,
             jobs,
             created_at: Utc::now(),
         }
@@ -159,8 +159,7 @@ jobs:
     #[test]
     fn all_jobs_start_pending() {
         let spec = parse(EXAMPLE).unwrap();
-        let topo_order = vec!["preprocess".into(), "train".into(), "eval".into()];
-        let run = WorkflowRun::new("run-001".into(), spec, topo_order);
+        let run = WorkflowRun::new("run-001".into(), spec);
 
         for job in run.jobs.values() {
             assert_eq!(job.state, JobState::Pending);
@@ -170,8 +169,7 @@ jobs:
     #[test]
     fn run_starts_pending() {
         let spec = parse(EXAMPLE).unwrap();
-        let topo_order = vec!["preprocess".into(), "train".into(), "eval".into()];
-        let run = WorkflowRun::new("run-001".into(), spec, topo_order);
+        let run = WorkflowRun::new("run-001".into(), spec);
 
         assert_eq!(run.status(), RunState::Pending);
     }
@@ -190,8 +188,7 @@ jobs:
     #[test]
     fn failed_job_makes_run_failed() {
         let spec = parse(EXAMPLE).unwrap();
-        let topo = vec!["preprocess".into(), "train".into(), "eval".into()];
-        let mut run = WorkflowRun::new("r1".into(), spec, topo);
+        let mut run = WorkflowRun::new("r1".into(), spec);
         run.jobs.get_mut("preprocess").unwrap().state = JobState::Failed;
         run.jobs.get_mut("train").unwrap().state = JobState::Running;
         assert_eq!(run.status(), RunState::Failed);
@@ -200,8 +197,7 @@ jobs:
     #[test]
     fn failed_bests_cancelled() {
         let spec = parse(EXAMPLE).unwrap();
-        let topo = vec!["preprocess".into(), "train".into(), "eval".into()];
-        let mut run = WorkflowRun::new("r1".into(), spec, topo);
+        let mut run = WorkflowRun::new("r1".into(), spec);
         run.jobs.get_mut("preprocess").unwrap().state = JobState::Failed;
         run.jobs.get_mut("train").unwrap().state = JobState::Cancelled;
         assert_eq!(run.status(), RunState::Failed);
@@ -210,8 +206,7 @@ jobs:
     #[test]
     fn all_succeeded_or_skipped_is_succeeded() {
         let spec = parse(EXAMPLE).unwrap();
-        let topo = vec!["preprocess".into(), "train".into(), "eval".into()];
-        let mut run = WorkflowRun::new("r1".into(), spec, topo);
+        let mut run = WorkflowRun::new("r1".into(), spec);
         run.jobs.get_mut("preprocess").unwrap().state = JobState::Succeeded;
         run.jobs.get_mut("train").unwrap().state = JobState::Skipped;
         run.jobs.get_mut("eval").unwrap().state = JobState::Skipped;

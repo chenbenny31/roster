@@ -5,6 +5,7 @@ use crate::workflow::spec::WorkflowSpec;
 /// Errors produced during DAG validation
 #[derive(Debug, PartialEq)]
 pub enum DagError {
+    EmptyWorkflow,
     DuplicateJobId { job_id: String },
     UnknownDependency { job_id: String, dep_id: String },
     Cycle { job_id: String },
@@ -13,6 +14,8 @@ pub enum DagError {
 impl std::fmt::Display for DagError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DagError::EmptyWorkflow =>
+                write!(formatter, "workflow must have at least one job"),
             DagError::DuplicateJobId { job_id } =>
                 write!(formatter, "duplicate job id: {}", job_id),
             DagError::UnknownDependency { job_id, dep_id } =>
@@ -24,10 +27,14 @@ impl std::fmt::Display for DagError {
 }
 
 /// Validate a workflow spec and return job IDs in topological execution order
-pub fn validate(spec: &WorkflowSpec) -> Result<Vec<String>, DagError> {
+pub fn validate(spec: &WorkflowSpec) -> Result<(), DagError> {
+    if spec.jobs.is_empty() {
+        return Err(DagError::EmptyWorkflow);
+    }
     check_duplicate_ids(spec)?;
     check_unknown_deps(spec)?;
-    topo_sort(spec)
+    topo_sort(spec)?;
+    Ok(())
 }
 
 /// Reject any workflow where two jobs share the same ID
@@ -121,7 +128,7 @@ mod tests {
     use crate::workflow::spec::parse;
 
     #[test]
-    fn linear_chain_correct_order() {
+    fn linear_chain_validates() {
         let spec = parse(r#"
 name: linear
 jobs:
@@ -135,12 +142,12 @@ jobs:
     depends_on: [b]
 "#).unwrap();
 
-        let order = validate(&spec).unwrap();
-        assert_eq!(order, vec!["a", "b", "c"]);
+        validate(&spec).unwrap();
+        assert!(validate(&spec).is_ok());
     }
 
     #[test]
-    fn diamond_dag_valid() {
+    fn diamond_dag_validates() {
         let spec = parse(r#"
 name: diamond
 jobs:
@@ -157,11 +164,7 @@ jobs:
     depends_on: [left, right]
 "#).unwrap();
 
-        let order = validate(&spec).unwrap();
-        // root must be first, merge must be last
-        assert_eq!(order.first().unwrap(), "root");
-        assert_eq!(order.last().unwrap(), "merge");
-        assert_eq!(order.len(), 4);
+        assert!(validate(&spec).is_ok());
     }
 
     #[test]
@@ -211,5 +214,14 @@ jobs:
             validate(&spec),
             Err(DagError::DuplicateJobId { .. })
         ));
+    }
+
+    #[test]
+    fn empty_workflow_rejected() {
+        let spec = parse(r#"
+name: empty
+jobs: []
+"#).unwrap();
+        assert!(matches!(validate(&spec), Err(DagError::EmptyWorkflow)));
     }
 }
