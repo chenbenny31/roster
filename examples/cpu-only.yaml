@@ -1,0 +1,14 @@
+name: cpu-only
+jobs:
+  - id: hello
+    command: echo hello from roster
+    resources:
+      cpu: 1
+      memory_mb: 512
+
+  - id: world
+    depends_on: [hello]
+    command: echo world
+    resources:
+      cpu: 1
+      memory_mb: 512

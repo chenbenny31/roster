@@ -15,11 +15,13 @@ use crate::ipc::server::handle_connection;
 use crate::paths::{pid_path, socket_path};
 use crate::resource::pool::ResourcePool;
 use crate::workflow::model::WorkflowRun;
+use crate::executor::shell::ShellExecutor;
 
 /// Shared daemon state, accessed behind Arch<DaemonState>
 pub struct DaemonState {
     pub runs: Mutex<HashMap<String, WorkflowRun>>, // run_id: WorkflowRun
     pub pool: Mutex<ResourcePool>,
+    pub executor: ShellExecutor,
 }
 
 impl DaemonState {
@@ -27,6 +29,7 @@ impl DaemonState {
         Arc::new(Self {
             runs: Mutex::new(HashMap::new()),
             pool: Mutex::new(pool),
+            executor: ShellExecutor,
         })
     }
 }

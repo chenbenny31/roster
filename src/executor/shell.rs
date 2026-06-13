@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use nix::sys::signal::{killpg, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use nix::errno::Errno;
 use tokio::time::{sleep, Duration};
 
 use crate::executor::{Executor, ExecutorError, PollResult};
@@ -72,6 +73,7 @@ impl Executor for ShellExecutor {
             Ok(WaitStatus::Exited(_, exit_code)) => Ok(PollResult::Exited { exit_code }),
             Ok(WaitStatus::Signaled(_, _, _)) => Ok(PollResult::Exited { exit_code: -1 }),
             Ok(_) => Ok(PollResult::Running),
+            Err(Errno::ECHILD) => Ok(PollResult::Exited { exit_code: 0 }), // already reaped by tokio
             Err(nix_error) => Err(ExecutorError::WaitFailed(nix_error.into())),
         }
     }

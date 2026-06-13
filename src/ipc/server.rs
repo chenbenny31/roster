@@ -10,6 +10,7 @@ use crate::ipc::protocol::{Request, Response};
 use crate::workflow::dag;
 use crate::workflow::model::WorkflowRun;
 use crate::workflow::spec;
+use crate::ipc::protocol::RunSummary;
 
 /// Handle one connection: read one req, dispatch, write one res, close
 pub async fn handle_connection(mut socket: UnixStream, state: Arc<DaemonState>) {
@@ -98,7 +99,17 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
     match request {
         Request::Ping => Response::Pong,
         Request::Submit { spec_yaml } => handle_submit(spec_yaml, state).await,
-        Request::Ps => Response::Error { message: "not implemented".into() },
+        Request::Ps => {
+            let runs = state.runs.lock().await;
+            let summaries = runs.values()
+                .map(|run| RunSummary {
+                    run_id: run.run_id.clone(),
+                    workflow_name: run.workflow_name.clone(),
+                    status: run.status(),
+                })
+                .collect();
+            Response::PsResult { runs: summaries }
+        },
         Request::Status { .. } => Response::Error { message: "not implemented".into() },
         Request::Logs { .. } => Response::Error { message: "not implemented".into() },
         Request::Cancel { .. } => Response::Error { message: "not implemented".into() },
