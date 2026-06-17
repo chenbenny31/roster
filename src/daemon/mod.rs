@@ -16,6 +16,7 @@ use crate::paths::{pid_path, socket_path};
 use crate::resource::pool::ResourcePool;
 use crate::workflow::model::WorkflowRun;
 use crate::executor::shell::ShellExecutor;
+use crate::scheduler;
 
 /// Shared daemon state, accessed behind Arch<DaemonState>
 pub struct DaemonState {
@@ -41,7 +42,10 @@ pub async fn run(state: Arc<DaemonState>) -> anyhow::Result<()> {
     write_pid_file()?;
     cleanup_stale_socket();
 
-    let result = listen(state).await;
+    let result = tokio::select! {
+        r = listen(state.clone()) => r,
+        _ = scheduler::run(state.clone()) => Ok(()),
+    };
     cleanup();
     result
 }

@@ -57,7 +57,7 @@ pub struct JobRun {
     pub cancelling: bool, // set before killpg, prevents non-zero exit
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
-    pub exit_code: Option<u32>,
+    pub exit_code: Option<i32>,
     pub log_path: Option<PathBuf>,
 }
 
