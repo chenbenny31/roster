@@ -17,30 +17,38 @@ use crate::resource::pool::ResourcePool;
 use crate::workflow::model::WorkflowRun;
 use crate::executor::shell::ShellExecutor;
 use crate::scheduler;
+use crate::store::RunStore;
+use crate::paths::db_path;
 
 /// Shared daemon state, accessed behind Arch<DaemonState>
 pub struct DaemonState {
     pub runs: Mutex<HashMap<String, WorkflowRun>>, // run_id: WorkflowRun
     pub pool: Mutex<ResourcePool>,
     pub executor: ShellExecutor,
+    pub store: RunStore,
 }
 
 impl DaemonState {
-    pub fn new(pool: ResourcePool) -> Arc<Self> {
+    pub fn new(pool: ResourcePool, store: RunStore) -> Arc<Self> {
         Arc::new(Self {
             runs: Mutex::new(HashMap::new()),
             pool: Mutex::new(pool),
             executor: ShellExecutor,
+            store,
         })
     }
 }
 
 /// Entry point for `roster daemon`
 /// enforce single instance, write PID file, bind socket, run until signal
-pub async fn run(state: Arc<DaemonState>) -> anyhow::Result<()> {
+pub async fn run(pool: ResourcePool) -> anyhow::Result<()> {
     check_not_running()?;
     write_pid_file()?;
     cleanup_stale_socket();
+
+    let store = RunStore::open(&db_path()).await?;
+    store.reconcile_interrupted().await?;
+    let state = DaemonState::new(pool, store);
 
     let result = tokio::select! {
         r = listen(state.clone()) => r,

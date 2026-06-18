@@ -17,6 +17,19 @@ pub enum RunState {
     Cancelled, // user cancelled, no failures during cancel
 }
 
+impl RunState {
+    /// canonical string for SQL storage, match upsert_job/upsert_run writes
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RunState::Pending => "Pending",
+            RunState::Running => "Running",
+            RunState::Succeeded => "Succeeded",
+            RunState::Failed => "Failed",
+            RunState::Cancelled => "Cancelled",
+        }
+    }
+}
+
 /// Full 9 variant job state machine
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JobState {
@@ -43,6 +56,21 @@ impl JobState {
             | JobState::TimedOut
             | JobState::Interrupted
         )
+    }
+
+    /// canonical string for SQL storage, match reconcile SQL literals
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobState::Pending => "Pending",
+            JobState::Queued => "Queued",
+            JobState::Running => "Running",
+            JobState::Succeeded => "Succeeded",
+            JobState::Failed => "Failed",
+            JobState::Skipped => "Skipped",
+            JobState::Cancelled => "Cancelled",
+            JobState::TimedOut => "Timed Out",
+            JobState::Interrupted => "Interrupted",
+        }
     }
 }
 

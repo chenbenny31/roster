@@ -50,8 +50,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Daemon => {
             let resources = discovery::discover();
             let pool = ResourcePool::new(resources);
-            let state = roster::daemon::DaemonState::new(pool);
-            roster::daemon::run(state).await?;
+            roster::daemon::run(pool).await?;
         },
         Command::Submit { file } => {
             let spec_yaml = tokio::fs::read_to_string(&file).await

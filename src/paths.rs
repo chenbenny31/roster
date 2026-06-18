@@ -19,3 +19,13 @@ pub fn socket_path() -> PathBuf {
 pub fn pid_path() -> PathBuf {
     runtime_dir().join("roster.pid")
 }
+
+/// SQLite database path: ~/.local/share/roster/roster.db
+pub fn db_path() -> PathBuf {
+    let home = std::env::var_os("HOME").expect("HOME not set");
+    PathBuf::from(home)
+        .join(".local")
+        .join("database")
+        .join("roster")
+        .join("roster.db")
+}
