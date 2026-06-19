@@ -30,61 +30,91 @@ async fn tick(state: &Arc<DaemonState>) {
 
 /// Pending -> Queued: transition jobs with succeeded dependencies
 async fn advance_pending(state: &Arc<DaemonState>) {
-    let mut runs = state.runs.lock().await;
+    // collect transitions first, write to SQLite after releasing lock
+    let mut to_write: Vec<(String, String)> = Vec::new(); // (run_id, job_id)
 
-    for run in runs.values_mut() {
-        let to_queue: Vec<String> = run.jobs.values()
-            .filter(|job| matches!(job.state, JobState::Pending))
-            .filter(|job| {
-                job.spec.depends_on.iter().all(|dep_id| {
-                    matches!(
-                        run.jobs.get(dep_id).map(|j| &j.state),
-                        Some(JobState::Succeeded)
-                    )
+    {
+        let mut runs = state.runs.lock().await;
+        for run in runs.values_mut() {
+            let to_queue: Vec<String> = run.jobs.values()
+                .filter(|job| matches!(job.state, JobState::Pending))
+                .filter(|job| {
+                    job.spec.depends_on.iter().all(|dep_id| {
+                        matches!(
+                            run.jobs.get(dep_id).map(|j| &j.state),
+                            Some(JobState::Succeeded)
+                        )
+                    })
                 })
-            })
-            .map(|job| job.job_id.clone())
-            .collect();
+                .map(|job| job.job_id.clone())
+                .collect();
 
-        for job_id in to_queue {
-            if let Some(job) = run.jobs.get_mut(&job_id) {
-                job.state = JobState::Queued;
-                tracing::info!(run_id = %run.run_id, %job_id, "job -> Queued");
+            for job_id in to_queue {
+                if let Some(job) = run.jobs.get_mut(&job_id) {
+                    job.state = JobState::Queued;
+                    tracing::info!(run_id = %run.run_id, %job_id, "job -> Queued");
+                    to_write.push((run.run_id.clone(), job_id));
+                }
             }
+        }
+    } // lock release
+
+    for (run_id, job_id) in &to_write {
+        let runs = state.runs.lock().await;
+        if let Some(run) = runs.get(run_id) {
+            if let Some(job) = run.jobs.get(job_id) {
+                let _ = state.store.upsert_job(run_id, job).await;
+            }
+            let _ = state.store.upsert_run(run).await;
         }
     }
 }
 
 /// Mark Pending/Queued jobs Skipped if missing any dependency
 async fn cascade_skipped(state: &Arc<DaemonState>) {
-    let mut runs = state.runs.lock().await;
+    let mut to_write: Vec<(String, String)> = Vec::new();
 
-    for run in runs.values_mut() {
-        let to_skip: Vec<String> = run.jobs.values()
-            .filter(|job| matches!(job.state, JobState::Pending | JobState::Queued))
-            .filter(|job| {
-                job.spec.depends_on.iter().any(|dep_id| {
-                    matches!(
-                        run.jobs.get(dep_id).map(|j| &j.state),
-                        Some(
-                            JobState::Failed
-                            | JobState::Skipped
-                            | JobState::Cancelled
-                            | JobState::TimedOut
-                            | JobState::Interrupted
+    {
+        let mut runs = state.runs.lock().await;
+
+        for run in runs.values_mut() {
+            let to_skip: Vec<String> = run.jobs.values()
+                .filter(|job| matches!(job.state, JobState::Pending | JobState::Queued))
+                .filter(|job| {
+                    job.spec.depends_on.iter().any(|dep_id| {
+                        matches!(
+                            run.jobs.get(dep_id).map(|j| &j.state),
+                            Some(
+                                JobState::Failed
+                                | JobState::Skipped
+                                | JobState::Cancelled
+                                | JobState::TimedOut
+                                | JobState::Interrupted
+                            )
                         )
-                    )
+                    })
                 })
-            })
-            .map(|job| job.job_id.clone())
-            .collect();
+                .map(|job| job.job_id.clone())
+                .collect();
 
-        for job_id in to_skip {
-            if let Some(job) = run.jobs.get_mut(&job_id) {
-                job.state = JobState::Skipped;
-                job.ended_at = Some(Utc::now());
-                tracing::info!(run_id = %run.run_id, %job_id, "job -> Skipped");
+            for job_id in to_skip {
+                if let Some(job) = run.jobs.get_mut(&job_id) {
+                    job.state = JobState::Skipped;
+                    job.ended_at = Some(Utc::now());
+                    tracing::info!(run_id = %run.run_id, %job_id, "job -> Skipped");
+                    to_write.push((run.run_id.clone(), job_id));
+                }
             }
+        }
+    }
+
+    for (run_id, job_id) in &to_write {
+        let runs = state.runs.lock().await;
+        if let Some(run) = runs.get(run_id) {
+            if let Some(job) = run.jobs.get(job_id) {
+                let _ = state.store.upsert_job(run_id, job).await;
+            }
+            let _ = state.store.upsert_run(run).await;
         }
     }
 }
@@ -140,6 +170,8 @@ async fn advance_queued(state: &Arc<DaemonState>) {
         });
     }
 
+    let mut to_write: Vec<(String, String)> = Vec::new();
+
     // phase 3: apply results under lock
     {
         let mut runs = state.runs.lock().await;
@@ -168,8 +200,19 @@ async fn advance_queued(state: &Arc<DaemonState>) {
                     pool.release(&outcome.alloc);
                     job.state = JobState::Failed;
                     job.ended_at = Some(Utc::now());
+                    to_write.push((outcome.run_id, outcome.job_id));
                 }
             }
+        }
+    }
+
+    for (run_id, job_id) in &to_write {
+        let runs = state.runs.lock().await;
+        if let Some(run) = runs.get(run_id) {
+            if let Some(job) = run.jobs.get(job_id) {
+                let _ = state.store.upsert_job(run_id, job).await;
+            }
+            let _ = state.store.upsert_run(run).await;
         }
     }
 }
@@ -221,6 +264,8 @@ async fn advance_running(state: &Arc<DaemonState>) {
         });
     }
 
+    let mut to_write: Vec<(String, String)> = Vec::new();
+
     // phase 3: apply result under lock
     {
         let mut runs = state.runs.lock().await;
@@ -263,8 +308,20 @@ async fn advance_running(state: &Arc<DaemonState>) {
                         tracing::info!(run_id = %entry.run_id, job_id = %entry.job_id, "job -> Failed");
                         JobState::Failed
                     };
+
+                    to_write.push((entry.run_id, entry.job_id));
                 }
             }
+        }
+    }
+
+    for (run_id, job_id) in &to_write {
+        let runs = state.runs.lock().await;
+        if let Some(run) = runs.get(run_id) {
+            if let Some(job) = run.jobs.get(job_id) {
+                let _ = state.store.upsert_job(run_id, job).await;
+            }
+            let _ = state.store.upsert_run(run).await;
         }
     }
 }
