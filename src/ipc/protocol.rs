@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::workflow::model::{JobState, RunState};
+use crate::workflow::model::JobState;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -15,7 +15,7 @@ pub enum Request {
     Submit { spec_yaml: String }, // client read file and send content
     Ps,
     Status { run_id: String },
-    Logs { job_id: String },
+    Logs { run_id: String, job_id: String },
     Cancel { run_id: String },
 }
 
@@ -25,7 +25,7 @@ pub enum Response {
     Pong,
     Submitted { run_id: String },
     PsResult { runs: Vec<RunSummary>},
-    StatusResult { run: String },
+    StatusResult { run: RunDetail },
     LogPath { path: String, status: JobState },
     Cancelled { run_id: String },
     Error { message: String },
@@ -35,12 +35,27 @@ pub enum Response {
 pub struct RunSummary {
     pub run_id: String,
     pub workflow_name: String,
-    pub status: RunState,
+    pub status: String,
 }
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct JobDetail {
+    pub job_id: String,
+    pub state: String,
+    pub exit_code: Option<i64>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub log_path: Option<String>,
+}
+
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RunDetail {
     pub run_id: String,
+    pub workflow_name: String,
+    pub status: String,
+    pub created_at: String,
+    pub jobs: Vec<JobDetail>,
 }
 
 #[cfg(test)]

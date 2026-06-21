@@ -10,7 +10,9 @@ use crate::ipc::protocol::{Request, Response};
 use crate::workflow::dag;
 use crate::workflow::model::WorkflowRun;
 use crate::workflow::spec;
-use crate::ipc::protocol::RunSummary;
+use crate::ipc::protocol::{JobDetail, RunDetail, RunSummary};
+use crate::workflow::model::JobState;
+use crate::executor::Executor;
 
 /// Handle one connection: read one req, dispatch, write one res, close
 pub async fn handle_connection(mut socket: UnixStream, state: Arc<DaemonState>) {
@@ -100,18 +102,85 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
         Request::Ping => Response::Pong,
         Request::Submit { spec_yaml } => handle_submit(spec_yaml, state).await,
         Request::Ps => {
-            let runs = state.runs.lock().await;
-            let summaries = runs.values()
-                .map(|run| RunSummary {
-                    run_id: run.run_id.clone(),
-                    workflow_name: run.workflow_name.clone(),
-                    status: run.status(),
-                })
-                .collect();
-            Response::PsResult { runs: summaries }
+            match state.store.list_runs().await {
+                Err(error) => Response::Error { message: format!("db error: {}", error) },
+                Ok(rows) => Response::PsResult {
+                    runs: rows.into_iter().map(|row| RunSummary {
+                        run_id: row.run_id,
+                        workflow_name: row.workflow_name,
+                        status: row.status,
+                    }).collect(),
+                },
+            }
         },
-        Request::Status { .. } => Response::Error { message: "not implemented".into() },
-        Request::Logs { .. } => Response::Error { message: "not implemented".into() },
-        Request::Cancel { .. } => Response::Error { message: "not implemented".into() },
+        Request::Status { run_id } => {
+            let run_row = match state.store.get_run(&run_id).await {
+                Err(error) => return Response::Error { message: format!("db error: {}", error) },
+                Ok(None) => return Response::Error { message: format!("run '{}' not found", run_id) },
+                Ok(Some(r)) => r,
+            };
+            let job_rows = match state.store.list_jobs(&run_id).await {
+                Err(error) => return Response::Error { message: format!("db error: {}", error) },
+                Ok(rows) => rows,
+            };
+            Response::StatusResult {
+                run: RunDetail {
+                    run_id: run_row.run_id,
+                    workflow_name: run_row.workflow_name,
+                    status: run_row.status,
+                    created_at: run_row.created_at,
+                    jobs: job_rows.into_iter().map(|j| JobDetail {
+                        job_id: j.job_id,
+                        state: j.state,
+                        exit_code: j.exit_code,
+                        started_at: j.started_at,
+                        ended_at: j.ended_at,
+                        log_path: j.log_path,
+                    }).collect(),
+                },
+            }
+        },
+        Request::Logs { run_id, job_id } => {
+            let job_rows = match state.store.list_jobs(&run_id).await {
+                Err(error) => return Response::Error { message: format!("db error: {}", error) },
+                Ok(rows) => rows,
+            };
+            match job_rows.into_iter().find(|j| j.job_id == job_id) {
+                None => Response::Error { message: format!("run '{}' not found in run '{}'", job_id, run_id) },
+                Some(job) => match job.log_path {
+                    None => Response::Error { message: "log not available yet".into() },
+                    Some(path) => Response::LogPath {
+                        path,
+                        status: serde_json::from_str(&format!("\"{}\"", job.state))
+                            .unwrap_or(crate::workflow::model::JobState::Pending),
+                    },
+                },
+            }
+        },
+        Request::Cancel { run_id } => {
+            // collect Running jobs under lock
+            let pids: Vec<(String, u32)> = {
+                let mut runs = state.runs.lock().await;
+                match runs.get_mut(&run_id) {
+                    None => return Response::Error { message: format!("run '{}' not found or not active", run_id) },
+                    Some(run) => {
+                        run.jobs.values_mut()
+                            .filter(|job| matches!(job.state, JobState::Running))
+                            .filter_map(|job| {
+                                job.cancelling = true;
+                                job.pid.map(|pid| (job.job_id.clone(), pid))
+                            })
+                            .collect()
+                    }
+                }
+            };
+
+            // cancel each running job outside the lock
+            for (_job_id, pid) in pids {
+                let _ = state.executor.cancel(pid).await;
+            }
+
+            Response::Cancelled { run_id }
+        },
     }
 }

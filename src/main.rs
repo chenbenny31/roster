@@ -67,7 +67,20 @@ async fn main() -> anyhow::Result<()> {
             println!("{:?}", response);
         },
         Command::Status { .. } => { unimplemented!("status") },
-        Command::Logs { .. } => { unimplemented!("logs") },
+        Command::Logs { id } => {
+            // id format: <run_id>/<job_id>
+            let parts: Vec<&str> = id.splitn(2, '/').collect();
+            if parts.len() != 2 {
+                anyhow::bail!("logs requires <run_id>/<job_id>");
+            }
+            let response = roster::ipc::client::send(
+                roster::ipc::protocol::Request::Logs {
+                    run_id: parts[0].into(),
+                    job_id: parts[1].into()
+                }
+            ).await?;
+            println!("{:?}", response);
+        },
         Command::Cancel { .. } => { unimplemented!("cancel") },
     }
 
