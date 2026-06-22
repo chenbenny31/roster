@@ -25,7 +25,18 @@ pub fn db_path() -> PathBuf {
     let home = std::env::var_os("HOME").expect("HOME not set");
     PathBuf::from(home)
         .join(".local")
-        .join("database")
+        .join("share")
         .join("roster")
         .join("roster.db")
+}
+/// Log file path for a job: ~/.local/share/roster/runs/<run_id>/<job_id>.log
+pub fn job_log_path(run_id: &str, job_id: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").expect("HOME not set");
+    PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("roster")
+        .join("runs")
+        .join(run_id)
+        .join(format!("{}.log", job_id))
 }

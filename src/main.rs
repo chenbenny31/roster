@@ -66,7 +66,12 @@ async fn main() -> anyhow::Result<()> {
             ).await?;
             println!("{:?}", response);
         },
-        Command::Status { .. } => { unimplemented!("status") },
+        Command::Status { id } => {
+            let response = roster::ipc::client::send(
+                roster::ipc::protocol::Request::Status { run_id: id }
+            ).await?;
+            println!("{:?}", response);
+        },
         Command::Logs { id } => {
             // id format: <run_id>/<job_id>
             let parts: Vec<&str> = id.splitn(2, '/').collect();

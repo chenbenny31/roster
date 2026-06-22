@@ -61,7 +61,7 @@ impl RunStore {
             "CREATE TABLE IF NOT EXISTS jobs (
                 run_id TEXT NOT NULL,
                 job_id TEXT NOT NULL,
-                status TEXT NOT NULL,
+                state TEXT NOT NULL,
                 exit_code INTEGER,
                 started_at TEXT,
                 ended_at TEXT,
@@ -115,7 +115,7 @@ impl RunStore {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "UPDATE runs SET state = 'Interrupted' WHERE state = 'Running'",
+            "UPDATE jobs SET state = 'Interrupted' WHERE state = 'Running'",
         )
         .execute(&mut *tx)
         .await?;
@@ -137,7 +137,7 @@ impl RunStore {
     /// List all runs ordered by creation time descending
     pub async fn list_runs(&self) -> anyhow::Result<Vec<RunRow>> {
         let rows = sqlx::query(
-            "SELECT run_id, worflow_name, status, created_at
+            "SELECT run_id, workflow_name, status, created_at
              FROM runs ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -172,8 +172,8 @@ impl RunStore {
     /// List all jobs for a run ordered by job_id
     pub async fn list_jobs(&self, run_id: &str) -> anyhow::Result<Vec<JobRow>> {
         let rows = sqlx::query(
-            "SELECT run_id, workflow_name, status, created_at
-             FROM runs WHERE run_id = ?",
+            "SELECT run_id, job_id, state, exit_code, started_at, ended_at, log_path
+             FROM jobs WHERE run_id = ? ORDER BY job_id",
         )
         .bind(run_id)
         .fetch_all(&self.pool)

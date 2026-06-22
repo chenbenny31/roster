@@ -47,6 +47,7 @@ pub async fn run(pool: ResourcePool) -> anyhow::Result<()> {
     cleanup_stale_socket();
 
     let store = RunStore::open(&db_path()).await?;
+    tracing::info!(path = %db_path().display(), "databased opened");
     store.reconcile_interrupted().await?;
     let state = DaemonState::new(pool, store);
 

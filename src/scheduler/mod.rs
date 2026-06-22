@@ -7,6 +7,7 @@ use crate::daemon::DaemonState;
 use crate::executor::{Executor, PollResult};
 use crate::resource::pool::Allocation;
 use crate::workflow::model::{JobRun, JobState};
+use crate::paths::job_log_path;
 
 const TICK_MS: u64 = 100;
 
@@ -193,6 +194,7 @@ async fn advance_queued(state: &Arc<DaemonState>) {
                     job.pid = Some(pid);
                     job.allocation = Some(outcome.alloc);
                     job.started_at = Some(Utc::now());
+                    job.log_path = Some(job_log_path(&outcome.run_id, &outcome.job_id));
                     tracing::info!(run_id = %outcome.run_id, job_id = %outcome.job_id, "job -> Running");
                 }
                 Err(error) => {

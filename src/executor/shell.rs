@@ -1,6 +1,5 @@
 use std::fs;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
 use std::process::Command;
 
 use async_trait::async_trait;
@@ -12,6 +11,7 @@ use tokio::time::{sleep, Duration};
 
 use crate::executor::{Executor, ExecutorError, PollResult};
 use crate::workflow::model::JobRun;
+use crate::paths::job_log_path;
 
 pub struct ShellExecutor;
 
@@ -20,7 +20,7 @@ impl Executor for ShellExecutor {
     /// Spawn `sh -c <command>` with stdout + stderr -> log file
     /// child gets its own process groups via setpig(0,0), killpg cancels all descendants
     async fn launch(&self, run_id: &str, job: &JobRun) -> Result<u32, ExecutorError> {
-        let log_path = log_file_path(run_id, &job.job_id);
+        let log_path = job_log_path(run_id, &job.job_id);
 
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent).map_err(ExecutorError::LogSetupFailed)?;
@@ -94,18 +94,6 @@ impl Executor for ShellExecutor {
     }
 }
 
-/// Log file path for a job: ~/.local/share/roster/runs/<run_id>/<job_id>.log
-fn log_file_path(run_id: &str, job_id: &str) -> PathBuf {
-    let home = std::env::var_os("HOME").expect("HOME not set");
-    PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("roster")
-        .join("runs")
-        .join(run_id)
-        .join(format!("{}.log", job_id))
-}
-
 // tests
 
 #[cfg(test)]
@@ -148,7 +136,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let _ = executor.poll(pid).await; // reap zombie
 
-        let log_path = log_file_path("test-run-002", "echo-job");
+        let log_path = job_log_path("test-run-002", "echo-job");
         let contents = fs::read_to_string(&log_path).unwrap();
         assert!(contents.contains("hello_roster"));
     }
