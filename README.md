@@ -1,8 +1,9 @@
 # roster
 
-GPU-aware single-node workflow scheduler. Submit a DAG of jobs as a YAML spec;
-the daemon schedules them in dependency order, tracks CPU/memory/VRAM as
-first-class resources, and persists run state across restarts.
+Single-node resource-aware execution runtime. Submit a DAG of jobs as a YAML
+spec; the daemon schedules them in dependency order, observes and reconciles
+CPU/RAM/VRAM usage against declared values, and persists run state across
+restarts.
 
 ## Quickstart
 
@@ -13,13 +14,16 @@ cargo build --release
 roster daemon
 
 # submit a workflow
-roster submit examples/train-and-eval.yaml
+roster submit examples/cpu-only.yaml
 
 # watch active runs
 roster ps
 
-# tail logs for a job
-roster logs <job-id>
+# show job-level detail for a run
+roster status <run-id>
+
+# get log path for a job
+roster logs <run-id>/<job-id>
 
 # cancel a run
 roster cancel <run-id>
@@ -53,29 +57,49 @@ jobs:
       vram_mb: 4000
 ```
 
+`gpu` is a count (number of GPUs required), not a device index. `vram_mb` is
+per-GPU. Jobs with `gpu: 0` are CPU-only. The scheduler places jobs on the
+first available GPUs with sufficient free VRAM (first-fit).
+
 Jobs run as soon as their dependencies finish and sufficient resources are
-available. The scheduler blocks a job rather than evicting a running one.
+available. The scheduler blocks rather than evicts.
 
 ## Architecture
 
-- **Daemon** — tokio async runtime, Unix socket IPC, graceful SIGTERM shutdown
-- **IPC** — newline-delimited JSON over `$XDG_RUNTIME_DIR/roster.sock` (falls back to `~/.local/run/roster.sock`)
-- **Scheduler** — Kahn's algorithm for topological ordering, resource accounting
-- **Executor** — shell command executor; captures stdout/stderr to disk
-- **Storage** — SQLite for run/job metadata; log files written directly, no daemon involvement
-- **Resource discovery** — sysinfo (CPU/RAM), nvml (per-GPU VRAM)
-- **Resource accounting** — user-declared; scheduler holds declared CPU/memory/VRAM in reserve for the job's lifetime
+- **Daemon** — tokio async runtime, Unix socket IPC, graceful SIGTERM/SIGINT shutdown with in-flight drain
+- **IPC** — newline-delimited JSON over `$XDG_RUNTIME_DIR/roster.sock` (fallback `~/.local/run/`)
+- **Scheduler** — 100ms tick loop: Kahn's DAG traversal, resource admission, failure cascade to Skipped
+- **Executor** — `sh -c` subprocess with `setpgid(0,0)`; cancel via `killpg(SIGTERM)` → 5s → `SIGKILL`; stdout/stderr captured to per-job log file
+- **Resource discovery** — sysinfo (CPU/RAM), NVML (per-GPU VRAM, graceful fallback if no driver)
+- **Resource accounting** — user-declared, conservative; `try_reserve` → `Allocation` → `release` on every terminal transition
+- **Storage** — SQLite via sqlx; run/job state persisted on every transition; restart reconciliation marks interrupted jobs terminal
+- **Broadcast** — lock-free SPMC ring buffer (seqlock, position-encoded versions, `!Sync` sender); feeds `roster top` (v0.2)
+
+## Resource observation (v0.3)
+
+The daemon will sample actual CPU/RAM/VRAM usage at 1 Hz via NVML and sysinfo,
+track per-job peaks, and reconcile declared vs actual on completion. Over runs
+this builds a workload profile for autosuggest.
 
 ## Non-goals
 
-- Multi-node / distributed scheduling
+- Multi-node / distributed scheduling (permanent)
 - Preemption or job migration
-- Python/container executors (v1 scope)
-- Retry policy (v1 scope)
+- Auto-resume of interrupted jobs (`Interrupted` is terminal)
+- CUDA dependency (NVML only — observes GPU resources, never executes GPU work)
+- Retry policy (implement in your job command)
+
+## Designed to compose
+
+Roster manages one node. For multi-node workloads, Roster is designed to act
+as the per-node agent in a two-level cluster scheduler — exposing resource
+availability and accepting remote submissions while a global scheduler handles
+placement across nodes.
 
 ## Status
 
-Under active development. API and wire protocol unstable.
+v0.1.0 shipped. v0.2 in progress: `roster top` TUI with lock-free SPMC event
+broadcast and HDR-histogram latency measurement.
 
 ## License
 
