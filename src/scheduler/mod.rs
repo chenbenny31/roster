@@ -4,6 +4,7 @@ use chrono::Utc;
 use tokio::time::{interval, Duration};
 
 use crate::daemon::DaemonState;
+use crate::event::{monotonic_raw_ns, JobEvent};
 use crate::executor::{Executor, PollResult};
 use crate::resource::pool::Allocation;
 use crate::workflow::model::{JobRun, JobState};
@@ -65,6 +66,12 @@ async fn advance_pending(state: &Arc<DaemonState>) {
         if let Some(run) = runs.get(run_id) {
             if let Some(job) = run.jobs.get(job_id) {
                 let _ = state.store.upsert_job(run_id, job).await;
+                let _ = state.events.send(JobEvent::StateChanged {
+                    run_id: run_id.clone(),
+                    job_id: job_id.clone(),
+                    new_state: job.state.clone(),
+                    emitted_at: monotonic_raw_ns(),
+                });
             }
             let _ = state.store.upsert_run(run).await;
         }
@@ -114,6 +121,12 @@ async fn cascade_skipped(state: &Arc<DaemonState>) {
         if let Some(run) = runs.get(run_id) {
             if let Some(job) = run.jobs.get(job_id) {
                 let _ = state.store.upsert_job(run_id, job).await;
+                let _ = state.events.send(JobEvent::StateChanged {
+                    run_id: run_id.clone(),
+                    job_id: job_id.clone(),
+                    new_state: job.state.clone(),
+                    emitted_at: monotonic_raw_ns(),
+                });
             }
             let _ = state.store.upsert_run(run).await;
         }
@@ -196,6 +209,7 @@ async fn advance_queued(state: &Arc<DaemonState>) {
                     job.started_at = Some(Utc::now());
                     job.log_path = Some(job_log_path(&outcome.run_id, &outcome.job_id));
                     tracing::info!(run_id = %outcome.run_id, job_id = %outcome.job_id, "job -> Running");
+                    to_write.push((outcome.run_id, outcome.job_id));
                 }
                 Err(error) => {
                     tracing::error!(run_id = %outcome.run_id, job_id = %outcome.job_id, %error, "launch failed -> Failed");
@@ -213,6 +227,12 @@ async fn advance_queued(state: &Arc<DaemonState>) {
         if let Some(run) = runs.get(run_id) {
             if let Some(job) = run.jobs.get(job_id) {
                 let _ = state.store.upsert_job(run_id, job).await;
+                let _ = state.events.send(JobEvent::StateChanged {
+                    run_id: run_id.clone(),
+                    job_id: job_id.clone(),
+                    new_state: job.state.clone(),
+                    emitted_at: monotonic_raw_ns(),
+                });
             }
             let _ = state.store.upsert_run(run).await;
         }
@@ -290,6 +310,7 @@ async fn advance_running(state: &Arc<DaemonState>) {
                     job.state = JobState::Failed;
                     job.ended_at = Some(Utc::now());
                     job.pid = None;
+                    to_write.push((entry.run_id, entry.job_id));
                 }
                 Ok(PollResult::Running) => {} // no chance
                 Ok(PollResult::Exited { exit_code }) => {
@@ -322,6 +343,12 @@ async fn advance_running(state: &Arc<DaemonState>) {
         if let Some(run) = runs.get(run_id) {
             if let Some(job) = run.jobs.get(job_id) {
                 let _ = state.store.upsert_job(run_id, job).await;
+                let _ = state.events.send(JobEvent::StateChanged {
+                    run_id: run_id.clone(),
+                    job_id: job_id.clone(),
+                    new_state: job.state.clone(),
+                    emitted_at: monotonic_raw_ns(),
+                });
             }
             let _ = state.store.upsert_run(run).await;
         }
