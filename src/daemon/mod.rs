@@ -9,6 +9,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
+use tokio::sync::broadcast;
 
 use crate::error::RosterError;
 use crate::ipc::server::handle_connection;
@@ -19,6 +20,7 @@ use crate::executor::shell::ShellExecutor;
 use crate::scheduler;
 use crate::store::RunStore;
 use crate::paths::db_path;
+use crate::event::JobEvent;
 
 /// Shared daemon state, accessed behind Arch<DaemonState>
 pub struct DaemonState {
@@ -26,15 +28,18 @@ pub struct DaemonState {
     pub pool: Mutex<ResourcePool>,
     pub executor: ShellExecutor,
     pub store: RunStore,
+    pub events: broadcast::Sender<JobEvent>,
 }
 
 impl DaemonState {
     pub fn new(pool: ResourcePool, store: RunStore) -> Arc<Self> {
+        let (events, _) = broadcast::channel(256);
         Arc::new(Self {
             runs: Mutex::new(HashMap::new()),
             pool: Mutex::new(pool),
             executor: ShellExecutor,
             store,
+            events,
         })
     }
 }

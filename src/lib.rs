@@ -7,3 +7,4 @@ pub mod resource;
 pub mod scheduler;
 pub mod store;
 pub mod workflow;
+pub mod event;
