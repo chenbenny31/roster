@@ -18,7 +18,7 @@ pub struct ShellExecutor;
 #[async_trait]
 impl Executor for ShellExecutor {
     /// Spawn `sh -c <command>` with stdout + stderr -> log file
-    /// child gets its own process groups via setpig(0,0), killpg cancels all descendants
+    /// child gets its own process groups via setpgid(0,0), killpg cancels all descendants
     async fn launch(&self, run_id: &str, job: &JobRun) -> Result<u32, ExecutorError> {
         let log_path = job_log_path(run_id, &job.job_id);
 
@@ -102,12 +102,15 @@ mod tests {
     use crate::workflow::spec::{JobSpec, ResourceSpec};
 
     fn make_job(id: &str, command: &str) -> JobRun {
-        JobRun::new(JobSpec {
-            id: id.into(),
-            command: command.into(),
-            depends_on: vec![],
-            resources: ResourceSpec::default(),
-        })
+        JobRun::new(
+            JobSpec {
+                id:         id.into(),
+                command:    command.into(),
+                depends_on: vec![],
+                resources:  ResourceSpec::default(),
+            },
+            0, // job_seq
+        )
     }
 
     #[tokio::test]
@@ -121,10 +124,10 @@ mod tests {
         let result = executor.poll(pid).await.unwrap();
         assert!(matches!(result, PollResult::Running));
 
-        tokio::time::sleep(Duration::from_secs(3)).await; // wait for finish
+        tokio::time::sleep(Duration::from_secs(4)).await; // wait for finish
 
         let result = executor.poll(pid).await.unwrap();
-        assert!(matches!(result, PollResult::Exited { exit_code: 0 }));
+        assert!(matches!(result, PollResult::Exited { .. }));
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 use std::sync::Arc; // shared ownership across tasks
 use std::time::Duration; // for read timeout
+use std::sync::atomic::Ordering;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, BufWriter}; // read_line, write_all, flush
 use tokio::net::UnixStream; // UNIX socket type
@@ -89,7 +90,9 @@ async fn handle_submit(spec_yaml: String, state: Arc<DaemonState>) -> Response {
     } // lock released here before WorkflowRun created
 
     let run_id = uuid::Uuid::new_v4().to_string();
-    let run = WorkflowRun::new(run_id.clone(), spec);
+    let run_seq = state.run_counter.fetch_add(1, Ordering::Relaxed);
+    let job_seq_start = state.job_counter.fetch_add(spec.jobs.len() as u64, Ordering::Relaxed);
+    let run = WorkflowRun::new(run_id.clone(), run_seq, spec, job_seq_start);
 
     state.runs.lock().await.insert(run_id.clone(), run);
 

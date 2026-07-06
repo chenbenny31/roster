@@ -3,44 +3,52 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc; // atomic reference counting for shared ownership across threads
+use std::sync::atomic::AtomicU64;
 
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
-use tokio::sync::broadcast;
 
+use crate::broadcast::{self as spmc, SpmcSubscriber};
 use crate::error::RosterError;
+use crate::event::JobEvent;
+use crate::executor::shell::ShellExecutor;
 use crate::ipc::server::handle_connection;
+use crate::paths::db_path;
 use crate::paths::{pid_path, socket_path};
 use crate::resource::pool::ResourcePool;
-use crate::workflow::model::WorkflowRun;
-use crate::executor::shell::ShellExecutor;
 use crate::scheduler;
 use crate::store::RunStore;
-use crate::paths::db_path;
-use crate::event::JobEvent;
+use crate::workflow::model::WorkflowRun;
 
 /// Shared daemon state, accessed behind Arch<DaemonState>
 pub struct DaemonState {
-    pub runs: Mutex<HashMap<String, WorkflowRun>>, // run_id: WorkflowRun
-    pub pool: Mutex<ResourcePool>,
-    pub executor: ShellExecutor,
-    pub store: RunStore,
-    pub events: broadcast::Sender<JobEvent>,
+    pub runs:        Mutex<HashMap<String, WorkflowRun>>, // run_id: WorkflowRun
+    pub pool:        Mutex<ResourcePool>,
+    pub executor:    ShellExecutor,
+    pub store:       RunStore,
+    pub events:      SpmcSubscriber<JobEvent>, // Sync, Clone - IPC handlers call .subscribe()
+    pub run_counter: AtomicU64, // fetch_add(1, Relaxed) at submit -> run_seq
+    pub job_counter: AtomicU64, // fetch_add(n, Relaxed) at submit -> job_seq_start
 }
 
 impl DaemonState {
-    pub fn new(pool: ResourcePool, store: RunStore) -> Arc<Self> {
-        let (events, _) = broadcast::channel(256);
-        Arc::new(Self {
-            runs: Mutex::new(HashMap::new()),
-            pool: Mutex::new(pool),
-            executor: ShellExecutor,
+    /// Returns the shared state plus the SpmcSender (must be moved into)
+    /// SpmcSender is !Sync - cannot live in Arc<DaemonState>
+    pub fn new(pool: ResourcePool, store: RunStore) -> (Arc<Self>, crate::broadcast::SpmcSender<JobEvent>) {
+        let (sender, events) = spmc::channel(256);
+        let state = Arc::new(Self {
+            runs:        Mutex::new(HashMap::new()),
+            pool:        Mutex::new(pool),
+            executor:    ShellExecutor,
             store,
             events,
-        })
+            run_counter: AtomicU64::new(0),
+            job_counter: AtomicU64::new(0),
+        });
+        (state, sender)
     }
 }
 
@@ -54,11 +62,11 @@ pub async fn run(pool: ResourcePool) -> anyhow::Result<()> {
     let store = RunStore::open(&db_path()).await?;
     tracing::info!(path = %db_path().display(), "databased opened");
     store.reconcile_interrupted().await?;
-    let state = DaemonState::new(pool, store);
+    let (state, event_sender) = DaemonState::new(pool, store);
 
     let result = tokio::select! {
         r = listen(state.clone()) => r,
-        _ = scheduler::run(state.clone()) => Ok(()),
+        _ = scheduler::run(state.clone(), event_sender) => Ok(()),
     };
     cleanup();
     result

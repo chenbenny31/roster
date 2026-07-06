@@ -2,11 +2,11 @@ use crate::workflow::model::JobState;
 
 /// Events emitted by the scheduler on every job state transition
 /// consumed by roster top via broadcast channel
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum JobEvent {
     StateChanged {
-        run_id: String,
-        job_id: String,
+        run_seq: u64,
+        job_seq: u64,
         new_state: JobState,
         emitted_at: u64, // CLOCK_MONOTONIC_RAW nanoseconds
     }
