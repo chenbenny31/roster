@@ -10,7 +10,7 @@ use nix::errno::Errno;
 use tokio::time::{sleep, Duration};
 
 use crate::executor::{Executor, ExecutorError, PollResult};
-use crate::workflow::model::JobRun;
+use crate::workflow::model::JobInstance;
 use crate::paths::job_log_path;
 
 pub struct ShellExecutor;
@@ -19,7 +19,7 @@ pub struct ShellExecutor;
 impl Executor for ShellExecutor {
     /// Spawn `sh -c <command>` with stdout + stderr -> log file
     /// child gets its own process groups via setpgid(0,0), killpg cancels all descendants
-    async fn launch(&self, run_id: &str, job: &JobRun) -> Result<u32, ExecutorError> {
+    async fn launch(&self, run_id: &str, job: &JobInstance) -> Result<u32, ExecutorError> {
         let log_path = job_log_path(run_id, &job.job_id);
 
         if let Some(parent) = log_path.parent() {
@@ -101,8 +101,8 @@ mod tests {
     use super::*;
     use crate::workflow::spec::{JobSpec, ResourceSpec};
 
-    fn make_job(id: &str, command: &str) -> JobRun {
-        JobRun::new(
+    fn make_job(id: &str, command: &str) -> JobInstance {
+        JobInstance::new(
             JobSpec {
                 id:         id.into(),
                 command:    command.into(),

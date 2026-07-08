@@ -9,7 +9,7 @@ use crate::event::{monotonic_raw_ns, JobEvent};
 use crate::executor::{Executor, PollResult};
 use crate::paths::job_log_path;
 use crate::resource::pool::Allocation;
-use crate::workflow::model::{JobRun, JobState};
+use crate::workflow::model::{JobInstance, JobState};
 
 const TICK_MS: u64 = 100;
 
@@ -132,7 +132,7 @@ async fn advance_queued(state: &Arc<DaemonState>, event_sender: &SpmcSender<JobE
     // phase 1: reserve under lock, collect launch tasks
     struct AdmitTask {
         run_id:  String,
-        job_run: JobRun,
+        job_run: JobInstance,
         alloc:   Allocation,
     }
 

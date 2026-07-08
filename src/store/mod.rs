@@ -3,7 +3,7 @@ use std::path::Path;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Row, SqlitePool};
 
-use crate::workflow::model::{JobRun, WorkflowRun};
+use crate::workflow::model::{JobInstance, WorkflowRun};
 
 /// persistent store for run and job state
 /// SQLite is the CLI read source, in-memory DaemonState is scheduler's working set
@@ -92,7 +92,7 @@ impl RunStore {
     }
 
     /// Write or overwrite a job's current state to SQLite
-    pub async fn upsert_job(&self, run_id: &str, job: &JobRun) -> anyhow::Result<()> {
+    pub async fn upsert_job(&self, run_id: &str, job: &JobInstance) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO jobs
              (run_id, job_id, state, exit_code, started_at, ended_at, log_path)

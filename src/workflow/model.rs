@@ -132,7 +132,7 @@ impl<'de> Deserialize<'de> for JobState {
 
 /// Runtime state of a single job within a workflow run
 #[derive(Debug, Clone)]
-pub struct JobRun {
+pub struct JobInstance {
     pub job_id:     String,
     pub job_seq:    u64, // assigned at submit, used in JobEvent (Copy payload)
     pub spec:       JobSpec,
@@ -146,7 +146,7 @@ pub struct JobRun {
     pub log_path:   Option<PathBuf>,
 }
 
-impl JobRun {
+impl JobInstance {
     pub fn new(spec: JobSpec, job_seq: u64) -> Self {
         Self {
             job_id:     spec.id.clone(),
@@ -171,7 +171,7 @@ pub struct WorkflowRun {
     pub run_seq:       u64,
     pub workflow_name: String,
     pub spec:          WorkflowSpec,
-    pub jobs:          HashMap<String, JobRun>, // keyed by job_id
+    pub jobs:          HashMap<String, JobInstance>, // keyed by job_id
     pub created_at:    DateTime<Utc>,
 }
 
@@ -182,7 +182,7 @@ impl WorkflowRun {
             .enumerate()
             .map(|(i, job_spec)| {
                 let job_seq = job_seq_start + i as u64;
-                (job_spec.id.clone(), JobRun::new(job_spec.clone(), job_seq))
+                (job_spec.id.clone(), JobInstance::new(job_spec.clone(), job_seq))
             })
             .collect();
 

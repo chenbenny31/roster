@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::workflow::model::JobRun;
+use crate::workflow::model::JobInstance;
 
 pub mod shell;
 
@@ -31,7 +31,7 @@ pub enum ExecutorError {
 #[async_trait]
 pub trait Executor: Send + Sync {
     /// Spawn the job subprocess, return the PID
-    async fn launch(&self, run_id: &str, job: &JobRun) -> Result<u32, ExecutorError>;
+    async fn launch(&self, run_id: &str, job: &JobInstance) -> Result<u32, ExecutorError>;
 
     /// Non-blocking check, return Running or Exited
     async fn poll(&self, pid: u32) -> Result<PollResult, ExecutorError>;
