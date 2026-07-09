@@ -4,42 +4,42 @@ use crate::workflow::spec::ResourceSpec;
 /// Concrete allocation produced by try_reserve, passed back to release
 #[derive(Debug, Clone)]
 pub struct Allocation {
-    pub cpu: u32,
+    pub cpu:       u32,
     pub memory_mb: u64,
-    pub gpus: Vec<GpuAllocation>, // empty for CPU-only jobs
+    pub gpus:      Vec<GpuAllocation>, // empty for CPU-only jobs
 }
 
 /// A single GPU slow within an allocation, records index and VRAM reserved
 #[derive(Debug, Clone)]
 pub struct GpuAllocation {
-    pub index: u32,
+    pub index:   u32,
     pub vram_mb: u64,
 }
 
 /// Tracks available resources, initialized from discovered hardware, mutated by reserve/release
 pub struct ResourcePool {
-    pub total: SystemResources,
-    pub available_cpu: u32,
+    pub total:               SystemResources,
+    pub available_cpu:       u32,
     pub available_memory_mb: u64,
-    pub available_vram_mb: Vec<u64>, // per GPU, indexed by GpuInfo.index
+    pub available_vram_mb:   Vec<u64>, // per GPU, indexed by GpuInfo.index
 }
 
 impl ResourcePool {
-    /// initialize pool from discovered hardware
+    /// initialize pool from discovered hardware, available starts equal to total
     pub fn new(resources: SystemResources) -> Self {
         let available_vram_mb = resources.gpus.iter().map(|gpu| gpu.vram_mb).collect();
         Self {
-            available_cpu: resources.cpu_cores,
+            available_cpu:       resources.cpu_cores,
             available_memory_mb: resources.memory_mb,
             available_vram_mb,
-            total: resources,
+            total:               resources,
         }
     }
 
-    /// Read-only admission check, used by `roster status`
+    /// Read-only admission check, used by `roster status` to explain Queued job
     pub fn can_admit(&self, spec: &ResourceSpec) -> bool {
         self.try_find_gpus(spec).is_some()
-            && self.available_cpu >= spec.cpu
+            && self.available_cpu       >= spec.cpu
             && self.available_memory_mb >= spec.memory_mb
     }
 
@@ -60,7 +60,7 @@ impl ResourcePool {
         };
 
         // commit as all check passed
-        self.available_cpu -= spec.cpu;
+        self.available_cpu       -= spec.cpu;
         self.available_memory_mb -= spec.memory_mb;
 
         for gpu_alloc in &gpu_allocs {
@@ -68,15 +68,15 @@ impl ResourcePool {
         }
 
         Some(Allocation {
-            cpu: spec.cpu,
+            cpu:       spec.cpu,
             memory_mb: spec.memory_mb,
-            gpus: gpu_allocs,
+            gpus:      gpu_allocs,
         })
     }
 
     /// Release a reserved allocation back to pool
     pub fn release(&mut self, alloc: &Allocation) {
-        self.available_cpu += alloc.cpu;
+        self.available_cpu       += alloc.cpu;
         self.available_memory_mb += alloc.memory_mb;
 
         for gpu_alloc in &alloc.gpus {

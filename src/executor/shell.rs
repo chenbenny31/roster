@@ -99,15 +99,14 @@ impl Executor for ShellExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::spec::{JobSpec, ResourceSpec};
+    use crate::workflow::spec::JobSpec;
 
     fn make_job(id: &str, command: &str) -> JobInstance {
         JobInstance::new(
             JobSpec {
                 id:         id.into(),
                 command:    command.into(),
-                depends_on: vec![],
-                resources:  ResourceSpec::default(),
+                ..Default::default()
             },
             0, // job_seq
         )

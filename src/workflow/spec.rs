@@ -8,7 +8,7 @@ pub struct WorkflowSpec {
 }
 
 /// Single job declaration inside a workflow YAML
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct JobSpec {
     pub id: String,
     pub command: String,
@@ -21,7 +21,8 @@ pub struct JobSpec {
 }
 
 /// Declared resource requirements for a job, held during job's lifetime
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceSpec {
     #[serde(default = "default_cpu")]
     pub cpu: u32,
@@ -118,5 +119,45 @@ jobs:
         let train = &spec.jobs[1];
         assert_eq!(train.resources.gpu, 1);
         assert_eq!(train.resources.vram_mb, 12000);
+    }
+
+    #[test]
+    fn unknown_field_in_job_spec_rejected() {
+        // typo protection
+        let yaml = r#"
+name: typo-test
+jobs:
+  - id: job1
+    commnad: echo hello
+"#;
+        assert!(parse(yaml).is_err());
+    }
+
+    #[test]
+    fn unknown_field_in_resource_spec_rejected() {
+        let yaml = r#"
+name: typo-test
+jobs:
+  - id: job1
+    command: echo hello
+    resources:
+      cpu: 2
+      memry_mb: 1024
+"#;
+        assert!(parse(yaml).is_err());
+    }
+
+    #[test]
+    fn struct_update_matches_yaml_omission_defaults() {
+        // Default::default() must produce the same values a YAML omission produces
+        let from_yaml = parse(r#"
+name: minimal
+jobs:
+  - id: job1
+    command: echo hello
+"#).unwrap().jobs[0].resources.clone();
+
+        let from_struct_update = ResourceSpec { ..Default::default() };
+        assert_eq!(from_yaml, from_struct_update);
     }
 }
