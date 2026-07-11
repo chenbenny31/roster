@@ -6,7 +6,7 @@ use tokio::time::{interval, Duration};
 use crate::broadcast::SpmcSender;
 use crate::daemon::DaemonState;
 use crate::event::{monotonic_raw_ns, JobEvent};
-use crate::executor::{Executor, PollResult};
+use crate::executor::{JobHandle, PollResult};
 use crate::paths::job_log_path;
 use crate::resource::pool::Allocation;
 use crate::workflow::model::{JobInstance, JobState};
@@ -14,7 +14,7 @@ use crate::workflow::model::{JobInstance, JobState};
 const TICK_MS: u64 = 100;
 
 /// Run the scheduler loop alongside the IPC listener, return only process exits
-/// owns the SpmcSender - the single writer to the event ring buffer:w
+/// owns the SpmcSender - the single writer to the event ring buffer
 pub async fn run(state: Arc<DaemonState>, event_sender: SpmcSender<JobEvent>) {
     let mut ticker = interval(Duration::from_millis(TICK_MS));
     loop {
@@ -132,7 +132,7 @@ async fn advance_queued(state: &Arc<DaemonState>, event_sender: &SpmcSender<JobE
     // phase 1: reserve under lock, collect launch tasks
     struct AdmitTask {
         run_id:  String,
-        job_run: JobInstance,
+        job_instance: JobInstance,
         alloc:   Allocation,
     }
 
@@ -150,7 +150,7 @@ async fn advance_queued(state: &Arc<DaemonState>, event_sender: &SpmcSender<JobE
                 if let Some(alloc) = pool.try_reserve(&job.spec.resources) {
                     tasks.push(AdmitTask {
                         run_id: run.run_id.clone(),
-                        job_run: job.clone(),
+                        job_instance: job.clone(),
                         alloc,
                     });
                 }
@@ -163,16 +163,16 @@ async fn advance_queued(state: &Arc<DaemonState>, event_sender: &SpmcSender<JobE
         run_id: String,
         job_id: String,
         alloc:  Allocation,
-        result: Result<u32, crate::executor::ExecutorError>,
+        result: Result<JobHandle, crate::executor::ExecutorError>,
     }
 
     let mut outcomes: Vec<LaunchOutcome> = Vec::new();
 
     for task in tasks {
-        let result = state.executor.launch(&task.run_id, &task.job_run).await;
+        let result = state.executor.launch(&task.run_id, &task.job_instance, &task.alloc).await;
         outcomes.push(LaunchOutcome {
             run_id: task.run_id,
-            job_id: task.job_run.job_id,
+            job_id: task.job_instance.job_id,
             alloc:  task.alloc,
             result,
         });
@@ -196,9 +196,9 @@ async fn advance_queued(state: &Arc<DaemonState>, event_sender: &SpmcSender<JobE
             };
 
             match outcome.result {
-                Ok(pid) => {
+                Ok(handle) => {
                     job.state       = JobState::Running;
-                    job.pid         = Some(pid);
+                    job.handle      = Some(handle);
                     job.allocation  = Some(outcome.alloc);
                     job.started_at  = Some(Utc::now());
                     job.log_path    = Some(job_log_path(&outcome.run_id, &outcome.job_id));
@@ -225,7 +225,7 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
     struct RunningJob {
         run_id:     String,
         job_id:     String,
-        pid:        u32,
+        handle:     JobHandle,
         cancelling: bool,
     }
 
@@ -235,10 +235,10 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
             .flat_map(|run| {
                 run.jobs.values()
                     .filter(|job| matches!(job.state, JobState::Running))
-                    .filter_map(|job| job.pid.map(|pid| RunningJob {
+                    .filter_map(|job| job.handle.clone().map(|handle| RunningJob {
                         run_id:     run.run_id.clone(),
                         job_id:     job.job_id.clone(),
-                        pid,
+                        handle,
                         cancelling: job.cancelling,
                     }))
                     .collect::<Vec<_>>()
@@ -257,7 +257,7 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
     let mut entries: Vec<PollEntry> = Vec::new();
 
     for job in running {
-        let result = state.executor.poll(job.pid).await;
+        let result = state.executor.poll(&job.handle).await;
         entries.push(PollEntry {
             run_id:     job.run_id,
             job_id:     job.job_id,
@@ -289,7 +289,7 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
                     if let Some(alloc) = job.allocation.take() { pool.release(&alloc); }
                     job.state    = JobState::Failed;
                     job.ended_at = Some(Utc::now());
-                    job.pid      =  None;
+                    job.handle   =  None;
                     to_write.push((entry.run_id, entry.job_id));
                 }
                 Ok(PollResult::Running) => {} // no change
@@ -298,7 +298,7 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
 
                     job.exit_code = Some(exit_code);
                     job.ended_at  = Some(Utc::now());
-                    job.pid       = None;
+                    job.handle    = None;
 
                     // cancelling flag prevents non-zero exit, failed when kill the job
                     job.state = if entry.cancelling {

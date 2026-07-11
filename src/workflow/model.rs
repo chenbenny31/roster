@@ -6,6 +6,7 @@ use serde::{Serializer, Deserializer, Serialize, Deserialize};
 
 use crate::resource::pool::Allocation;
 use crate::workflow::spec::{JobSpec, WorkflowSpec};
+use crate::executor::JobHandle;
 
 /// Run level state - derived from job states, never stored in memory
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -137,9 +138,9 @@ pub struct JobInstance {
     pub job_seq:    u64, // assigned at submit, used in JobEvent (Copy payload)
     pub spec:       JobSpec,
     pub state:      JobState,
-    pub pid:        Option<u32>, // set when Running, cleared on termin
+    pub handle:     Option<JobHandle>, // set when Running, cleared on termin
     pub allocation: Option<Allocation>,
-    pub cancelling: bool, // set before killpg, prevents non-zero exit -> Failed
+    pub cancelling: bool, // set before cancel, prevents non-zero exit -> Failed
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at:   Option<DateTime<Utc>>,
     pub exit_code:  Option<i32>,
@@ -153,7 +154,7 @@ impl JobInstance {
             job_seq,
             spec,
             state:      JobState::Pending,
-            pid:        None,
+            handle: None,
             allocation: None,
             cancelling: false,
             started_at: None,

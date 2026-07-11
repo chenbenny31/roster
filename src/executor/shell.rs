@@ -9,9 +9,10 @@ use nix::unistd::Pid;
 use nix::errno::Errno;
 use tokio::time::{sleep, Duration};
 
-use crate::executor::{Executor, ExecutorError, PollResult};
+use crate::executor::{Executor, ExecutorError, PollResult, JobHandle};
 use crate::workflow::model::JobInstance;
 use crate::paths::job_log_path;
+use crate::resource::pool::Allocation;
 
 pub struct ShellExecutor;
 
@@ -19,7 +20,8 @@ pub struct ShellExecutor;
 impl Executor for ShellExecutor {
     /// Spawn `sh -c <command>` with stdout + stderr -> log file
     /// child gets its own process groups via setpgid(0,0), killpg cancels all descendants
-    async fn launch(&self, run_id: &str, job: &JobInstance) -> Result<u32, ExecutorError> {
+    async fn launch(&self, run_id: &str, job: &JobInstance, placement: &Allocation)
+            -> Result<JobHandle, ExecutorError> {
         let log_path = job_log_path(run_id, &job.job_id);
 
         if let Some(parent) = log_path.parent() {
@@ -35,10 +37,17 @@ impl Executor for ShellExecutor {
 
         let stderr_file = log_file.try_clone().map_err(ExecutorError::LogSetupFailed)?;
 
+        let gpu_indices: String = placement.gpus
+            .iter()
+            .map(|gpu_alloc| gpu_alloc.index.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
         let mut command = Command::new("sh");
         command
             .arg("-c")
             .arg(&job.spec.command)
+            .env("CUDA_VISIBLE_DEVICES", &gpu_indices)
             .stdout(log_file)
             .stderr(stderr_file);
 
@@ -54,19 +63,19 @@ impl Executor for ShellExecutor {
         }
 
         let child = command.spawn().map_err(ExecutorError::SpawnFailed)?;
-        let pid = child.id();
+        let host_pid = child.id();
 
         // Drop child handle - process continues running independently
         // poll() via waitpid reaps the zombie when it exits
         drop(child);
 
-        tracing::info!(pid, job_id = %job.job_id, "job launched");
-        Ok(pid)
+        tracing::info!(host_pid, job_id = %job.job_id, cuda_visible_devices = %gpu_indices, "job launched");
+        Ok(JobHandle::process(host_pid))
     }
 
     /// Non-blocking process check via waitpid(WNOHANG)
-    async fn poll(&self, pid: u32) -> Result<PollResult, ExecutorError> {
-        let pid = Pid::from_raw(pid as i32);
+    async fn poll(&self, handle: &JobHandle) -> Result<PollResult, ExecutorError> {
+        let pid = Pid::from_raw(handle.host_pid as i32);
 
         match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => Ok(PollResult::Running),
@@ -79,8 +88,8 @@ impl Executor for ShellExecutor {
     }
 
     /// Send SIGTERM to process group, wait 5s, send SIGKILL, pgid == pid
-    async fn cancel(&self, pid: u32) -> Result<(), ExecutorError> {
-        let pgid = Pid::from_raw(pid as i32);
+    async fn cancel(&self, handle: &JobHandle) -> Result<(), ExecutorError> {
+        let pgid = Pid::from_raw(handle.host_pid as i32);
 
         killpg(pgid, Signal::SIGTERM)
             .map_err(|error| ExecutorError::KillFailed(error.into()))?;
@@ -100,6 +109,7 @@ impl Executor for ShellExecutor {
 mod tests {
     use super::*;
     use crate::workflow::spec::JobSpec;
+    use crate::resource::pool::GpuAllocation;
 
     fn make_job(id: &str, command: &str) -> JobInstance {
         JobInstance::new(
@@ -112,20 +122,24 @@ mod tests {
         )
     }
 
+    fn cpu_only_placement() -> Allocation {
+        Allocation { cpu: 1, memory_mb: 512, gpus: vec![] }
+    }
+
     #[tokio::test]
     async fn launch_and_poll_sleep() {
         let executor = ShellExecutor;
         let job = make_job("sleep_job", "sleep 2");
-        let pid = executor.launch("test-run-001", &job).await.unwrap();
+        let handle = executor.launch("test-run-001", &job, &cpu_only_placement()).await.unwrap();
 
-        assert!(pid > 0);
+        assert!(handle.host_pid > 0);
 
-        let result = executor.poll(pid).await.unwrap();
+        let result = executor.poll(&handle).await.unwrap();
         assert!(matches!(result, PollResult::Running));
 
         tokio::time::sleep(Duration::from_secs(4)).await; // wait for finish
 
-        let result = executor.poll(pid).await.unwrap();
+        let result = executor.poll(&handle).await.unwrap();
         assert!(matches!(result, PollResult::Exited { .. }));
     }
 
@@ -133,10 +147,10 @@ mod tests {
     async fn launch_echo_writes_log() {
         let executor = ShellExecutor;
         let job = make_job("echo-job", "echo hello_roster");
-        let pid = executor.launch("test-run-002", &job).await.unwrap();
+        let handle = executor.launch("test-run-002", &job, &cpu_only_placement()).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let _ = executor.poll(pid).await; // reap zombie
+        let _ = executor.poll(&handle).await; // reap zombie
 
         let log_path = job_log_path("test-run-002", "echo-job");
         let contents = fs::read_to_string(&log_path).unwrap();
@@ -147,11 +161,30 @@ mod tests {
     async fn cancel_kills_process() {
         let executor = ShellExecutor;
         let job = make_job("cancel-job", "sleep 60");
-        let pid = executor.launch("test-run-003", &job).await.unwrap();
+        let handle = executor.launch("test-run-003", &job, &cpu_only_placement()).await.unwrap();
 
-        executor.cancel(pid).await.unwrap();
+        executor.cancel(&handle).await.unwrap();
 
-        let result = executor.poll(pid).await.unwrap();
+        let result = executor.poll(&handle).await.unwrap();
         assert!(matches!(result, PollResult::Exited { .. }));
+    }
+
+    #[tokio::test]
+    async fn cuda_visible_devices_set_from_placement() {
+        let executor = ShellExecutor;
+        let job = make_job("gpu-echo-job", "echo $CUDA_VISIBLE_DEVICES");
+        let placement = Allocation {
+            cpu: 1,
+            memory_mb: 512,
+            gpus: vec![GpuAllocation { index: 1, vram_mb: 4000 }],
+        };
+        let handle = executor.launch("test-run-004", &job, &placement).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = executor.poll(&handle).await.unwrap();
+
+        let log_path = job_log_path("test-run-004", "gpu-echo-job");
+        let contents = fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("1"));
     }
 }

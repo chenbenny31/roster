@@ -15,6 +15,7 @@ use crate::broadcast::{self as spmc, SpmcSubscriber};
 use crate::error::RosterError;
 use crate::event::JobEvent;
 use crate::executor::shell::ShellExecutor;
+use crate::executor::Executor;
 use crate::ipc::server::handle_connection;
 use crate::paths::db_path;
 use crate::paths::{pid_path, socket_path};
@@ -27,7 +28,7 @@ use crate::workflow::model::WorkflowRun;
 pub struct DaemonState {
     pub runs:        Mutex<HashMap<String, WorkflowRun>>, // run_id: WorkflowRun
     pub pool:        Mutex<ResourcePool>,
-    pub executor:    ShellExecutor,
+    pub executor:    Arc<dyn Executor>, // not a concrete ShellExecutor
     pub store:       RunStore,
     pub events:      SpmcSubscriber<JobEvent>, // Sync, Clone - IPC handlers call .subscribe()
     pub run_counter: AtomicU64, // fetch_add(1, Relaxed) at submit -> run_seq
@@ -42,7 +43,7 @@ impl DaemonState {
         let state = Arc::new(Self {
             runs:        Mutex::new(HashMap::new()),
             pool:        Mutex::new(pool),
-            executor:    ShellExecutor,
+            executor:    Arc::new(ShellExecutor),
             store,
             events,
             run_counter: AtomicU64::new(0),

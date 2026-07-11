@@ -1,8 +1,32 @@
 use async_trait::async_trait;
 
 use crate::workflow::model::JobInstance;
+use crate::resource::pool::Allocation;
 
 pub mod shell;
+
+// Opaque handle to a launched job, return by `launch` and passed back to `poll`/`cancel`
+#[derive(Debug, Clone)]
+pub struct JobHandle {
+    pub host_pid: u32,
+    #[allow(dead_code)]
+    backend: Backend,
+}
+
+impl JobHandle {
+    /// Construct a handle for a plain host process (ShellExecutor)
+    pub(crate) fn process(host_pid: u32) -> Self {
+        Self { host_pid, backend: Backend::Process }
+    }
+}
+
+/// Concrete executor produced a handle and specific identity to operate job later
+#[derive(Debug, Clone)]
+enum Backend {
+    Process,
+    #[allow(dead_code)]
+    Container(String),
+}
 
 /// Result of non-blocking process poll
 #[derive(Debug)]
@@ -31,11 +55,12 @@ pub enum ExecutorError {
 #[async_trait]
 pub trait Executor: Send + Sync {
     /// Spawn the job subprocess, return the PID
-    async fn launch(&self, run_id: &str, job: &JobInstance) -> Result<u32, ExecutorError>;
+    async fn launch(&self, run_id: &str, job: &JobInstance, placement: &Allocation)
+        -> Result<JobHandle, ExecutorError>;
 
     /// Non-blocking check, return Running or Exited
-    async fn poll(&self, pid: u32) -> Result<PollResult, ExecutorError>;
+    async fn poll(&self, handle: &JobHandle) -> Result<PollResult, ExecutorError>;
 
     /// Send SIGTERM, wait 5s, send SIGKILL, return when signal is sent
-    async fn cancel(&self, pid: u32) -> Result<(), ExecutorError>;
+    async fn cancel(&self, handle: &JobHandle) -> Result<(), ExecutorError>;
 }

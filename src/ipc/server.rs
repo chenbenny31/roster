@@ -7,13 +7,11 @@ use tokio::net::UnixStream; // UNIX socket type
 use tokio::time::timeout;
 
 use crate::daemon::DaemonState;
-use crate::ipc::protocol::{Request, Response};
+use crate::executor::JobHandle;
+use crate::ipc::protocol::{JobDetail, RunDetail, RunSummary, Request, Response};
 use crate::workflow::dag;
-use crate::workflow::model::WorkflowRun;
+use crate::workflow::model::{JobState, WorkflowRun};
 use crate::workflow::spec;
-use crate::ipc::protocol::{JobDetail, RunDetail, RunSummary};
-use crate::workflow::model::JobState;
-use crate::executor::Executor;
 
 /// Handle one connection: read one req, dispatch, write one res, close
 pub async fn handle_connection(mut socket: UnixStream, state: Arc<DaemonState>) {
@@ -161,8 +159,8 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
             }
         },
         Request::Cancel { run_id } => {
-            // collect Running jobs under lock
-            let pids: Vec<(String, u32)> = {
+            // collect Running jobs's handles under lock
+            let handles: Vec<(String, JobHandle)> = {
                 let mut runs = state.runs.lock().await;
                 match runs.get_mut(&run_id) {
                     None => return Response::Error { message: format!("run '{}' not found or not active", run_id) },
@@ -171,7 +169,7 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
                             .filter(|job| matches!(job.state, JobState::Running))
                             .filter_map(|job| {
                                 job.cancelling = true;
-                                job.pid.map(|pid| (job.job_id.clone(), pid))
+                                job.handle.clone().map(|handle| (job.job_id.clone(), handle))
                             })
                             .collect()
                     }
@@ -179,8 +177,8 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
             };
 
             // cancel each running job outside the lock
-            for (_job_id, pid) in pids {
-                let _ = state.executor.cancel(pid).await;
+            for (_job_id, handle) in handles {
+                let _ = state.executor.cancel(&handle).await;
             }
 
             Response::Cancelled { run_id }
