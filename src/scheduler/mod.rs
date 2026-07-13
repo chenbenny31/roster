@@ -47,7 +47,6 @@ async fn flush_transitions(state: &Arc<DaemonState>,
                     emitted_at: monotonic_raw_ns(),
                 });
             }
-            let _ = state.store.upsert_run(run).await;
         }
     }
 }

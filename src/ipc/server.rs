@@ -92,6 +92,11 @@ async fn handle_submit(spec_yaml: String, state: Arc<DaemonState>) -> Response {
     let job_seq_start = state.job_counter.fetch_add(spec.jobs.len() as u64, Ordering::Relaxed);
     let run = WorkflowRun::new(run_id.clone(), run_seq, spec, job_seq_start);
 
+    let _ = state.store.upsert_run(&run).await;
+    for job in run.jobs.values() {
+        let _ = state.store.upsert_job(&run_id, job).await;
+    }
+
     state.runs.lock().await.insert(run_id.clone(), run);
 
     Response::Submitted { run_id }

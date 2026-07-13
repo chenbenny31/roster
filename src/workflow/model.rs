@@ -131,6 +131,24 @@ impl<'de> Deserialize<'de> for JobState {
     }
 }
 
+/// Derive run state from an iterator of job states
+pub fn derive_run_state(states: impl Iterator<Item = JobState>) -> RunState {
+    let states: Vec<JobState> = states.collect();
+    if states.iter().any(|s| matches!(s, JobState::Failed | JobState::TimedOut | JobState::Interrupted)) {
+        return RunState::Failed;
+    }
+    if states.iter().any(|s| matches!(s, JobState::Cancelled)) {
+        return RunState::Cancelled;
+    }
+    if states.iter().any(|s| matches!(s, JobState::Running | JobState::Queued)) {
+        return RunState::Running;
+    }
+    if !states.is_empty() && states.iter().all(|s| matches!(s, JobState::Succeeded | JobState::Skipped)) {
+        return RunState::Succeeded;
+    }
+    RunState::Pending
+}
+
 /// Runtime state of a single job within a workflow run
 #[derive(Debug, Clone)]
 pub struct JobInstance {
@@ -154,7 +172,7 @@ impl JobInstance {
             job_seq,
             spec,
             state:      JobState::Pending,
-            handle: None,
+            handle:     None,
             allocation: None,
             cancelling: false,
             started_at: None,
@@ -202,19 +220,7 @@ impl WorkflowRun {
     /// Derive run state from job states, computed on demand
     /// Precedence: Failed/TimeOut/Interrupted > Cancelled > Running > Succeeded > Pending
     pub fn status(&self) -> RunState {
-        if self.jobs.values().any(|j| matches!(j.state, JobState::Failed | JobState::TimedOut | JobState::Interrupted)) {
-            return RunState::Failed;
-        }
-        if self.jobs.values().any(|j| matches!(j.state, JobState::Cancelled)) {
-            return RunState::Cancelled;
-        }
-        if self.jobs.values().any(|j| matches!(j.state, JobState::Running | JobState::Queued)) {
-            return RunState::Running;
-        }
-        if self.jobs.values().all(|j| matches!(j.state, JobState::Succeeded | JobState::Skipped)) {
-            return RunState::Succeeded;
-        }
-        RunState::Pending
+        derive_run_state(self.jobs.values().map(|j| j.state))
     }
 }
 
@@ -345,5 +351,17 @@ jobs:
         run.jobs.get_mut("train").unwrap().state = JobState::Skipped;
         run.jobs.get_mut("eval").unwrap().state = JobState::Skipped;
         assert_eq!(run.status(), RunState::Succeeded);
+    }
+
+    // derive_run_state direct tests
+    #[test]
+    fn derive_run_state_empty_is_pending_not_succeeded() {
+        assert_eq!(derive_run_state(std::iter::empty()), RunState::Pending);
+    }
+
+    #[test]
+    fn derive_run_state_partial_flush_is_not_succeeded() {
+        let partial = vec![JobState::Succeeded];
+        assert_eq!(derive_run_state(partial.into_iter()), RunState::Succeeded);
     }
 }
