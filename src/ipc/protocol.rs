@@ -31,31 +31,34 @@ pub enum Response {
     Error { message: String },
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
 pub struct RunSummary {
-    pub run_id: String,
+    pub run_id:        String,
     pub workflow_name: String,
-    pub status: String,
+    pub status:        String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
 pub struct JobDetail {
-    pub job_id: String,
-    pub state: String,
-    pub exit_code: Option<i64>,
+    pub job_id:     String,
+    pub state:      String,
+    pub exit_code:  Option<i64>,
     pub started_at: Option<String>,
-    pub ended_at: Option<String>,
-    pub log_path: Option<String>,
+    pub ended_at:   Option<String>,
+    pub log_path:   Option<String>,
 }
 
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
 pub struct RunDetail {
-    pub run_id: String,
+    pub run_id:        String,
     pub workflow_name: String,
-    pub status: String,
-    pub created_at: String,
-    pub jobs: Vec<JobDetail>,
+    pub status:        String,
+    pub created_at:    String,
+    pub jobs:          Vec<JobDetail>,
 }
 
 #[cfg(test)]
@@ -110,5 +113,39 @@ mod tests {
         let res = Response::Error { message: "malformed request".into() };
         let Response::Error { message } = round_trip_response(res) else { panic!() };
         assert_eq!(message, "malformed request");
+    }
+
+    #[test]
+    fn run_summary_missing_field_defaults_instead_of_failing() {
+        let json = r#"{"run_id": "abc-123", "workflow_name": "train"}"#;
+        let summary: RunDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(summary.run_id, "abc-123");
+        assert_eq!(summary.workflow_name, "train");
+        assert_eq!(summary.status, "");
+    }
+
+    #[test]
+    fn job_default_missing_optional_fields_defaults_to_none() {
+        let json = r#"{"job_id": "train", "state": "Running"}"#;
+        let detail: JobDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(detail.job_id, "train");
+        assert_eq!(detail.state, "Running");
+        assert_eq!(detail.exit_code, None);
+        assert_eq!(detail.log_path, None);
+    }
+
+    #[test]
+    fn run_default_unknown_extra_field_is_ignored_not_rejected() {
+        let json = r#"{
+            "run_id": "abc-123",
+            "workflow_name": "train",
+            "status": "Running",
+            "created_at": "2026-07-12T00:00:00Z",
+            "jobs": [],
+            "future_field_this_struct_does_not_know_about": 42
+        }"#;
+        let detail: RunDetail = serde_json::from_str(json).unwrap();
+        assert_eq!(detail.run_id, "abc-123");
+        assert_eq!(detail.status, "Running");
     }
 }
