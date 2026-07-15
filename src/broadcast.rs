@@ -21,64 +21,90 @@
 //! Positions are `usize` and the version stores `2*p + {1,2}`
 //! scheme is correct until `2*p` overflows `usize`: 9.2e18 events on 64-bit, unreachable
 
-use std::cell::UnsafeCell;
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::sync::Arc;
-use std::sync::atomic::{fence, AtomicUsize, Ordering};
-use std::cell::Cell;
 
-/// One ring slot, cache-line aligned to prevent false sharing between adjacent slots
-#[repr(align(64))]
-struct Slot<T: Copy> {
-    version: AtomicUsize, // position-encoded seqlock version
-    data: UnsafeCell<MaybeUninit<T>>, // payload written by producer between version bump
+#[cfg(feature = "loom")]
+use loom::cell::UnsafeCell;
+#[cfg(feature = "loom")]
+use loom::sync::atomic::{fence, AtomicUsize, Ordering};
+#[cfg(feature = "loom")]
+use loom::sync::Arc;
+
+#[cfg(not(feature = "loom"))]
+use std::sync::atomic::{fence, AtomicUsize, Ordering};
+#[cfg(not(feature = "loom"))]
+use std::sync::Arc;
+
+#[cfg(not(feature = "loom"))]
+mod cell {
+    use std::cell::UnsafeCell as StdUnsafeCell;
+
+    pub(crate) struct UnsafeCell<T>(StdUnsafeCell<T>);
+
+    impl<T> UnsafeCell<T> {
+        pub(crate) fn new(data: T) -> Self {
+            UnsafeCell(StdUnsafeCell::new(data))
+        }
+
+        pub(crate) fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
+            f(self.0.get())
+        }
+
+        pub(crate) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+            f(self.0.get())
+        }
+    }
 }
 
-/// Producer cursor on its own cache line to prevent false sharing with slots
+#[cfg(not(feature = "loom"))]
+use cell::UnsafeCell;
+
+/// One ring slot, cache-line aligned to prevent false sharing between adjacent
+#[repr(align(64))]
+struct Slot<T: Copy> {
+    version: AtomicUsize,
+    data: UnsafeCell<MaybeUninit<T>>,
+}
+
+/// Producer cursor on its own cache line to prevent false sharing between slots
 #[repr(align(64))]
 struct PaddedCursor {
     value: AtomicUsize,
 }
 
 struct RingBuffer<T: Copy> {
-    mask: usize, // index = pos & mask
-    slots: Box<[Slot<T>]>, // read-only after construction
-    producer: PaddedCursor, // single-producer cursor, own cache line
+    mask:     usize, // capacity - 1; index = pos & mask
+    slots:    Box<[Slot<T>]>, // read-only after construction
+    producer: PaddedCursor, // single-producer cursor; own cache line
 }
 
-// All access to non-atomic data cells is mediated by per-slot version seqlock
+// all access to non-atomic data cells is mediated by the per-slot version seqlock
 unsafe impl<T: Copy + Send> Send for RingBuffer<T> {}
 unsafe impl<T: Copy + Send> Sync for RingBuffer<T> {}
 
-/// Single producer, moved into scheduler task
+/// The single producer, moved into scheduler task
 pub struct SpmcSender<T: Copy> {
-    buffer: Arc<RingBuffer<T>>,
-    _not_sync: PhantomData<Cell<()>>,
+    buffer:     Arc<RingBuffer<T>>,
+    _not_sync:  std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
 impl<T: Copy + Send> SpmcSender<T> {
-    /// Publish one event, wait-free, overwritten the oldest on a full ring, single producer
+    /// Publish one event, wait-free, the oldest slot if overwritten (lossy)
     pub fn send(&self, value: T) {
         let buffer = &*self.buffer;
 
-        // claim position, relaxed: cursor carries not data dependency
         let pos = buffer.producer.value.fetch_add(1, Ordering::Relaxed);
         let slot = &buffer.slots[pos & buffer.mask];
 
-        // mark "writing" (odd), relaxed
-        slot.version.store(2 * pos + 1, Ordering::Relaxed);
+        slot.version.store(2 * pos + 1, Ordering::Relaxed); // marking "writing"
 
-        // release fence: prevent payload store being re-ordered
-        fence(Ordering::Release);
+        fence(Ordering::Release); // prevent payload store from being reordered
 
-        // single produce writes, concurrent readers
-        unsafe {
-            (*slot.data.get()).write(value);
-        }
+        slot.data.with_mut(|ptr| unsafe { // single producer, no concurrent writers
+            (*ptr).write(value);
+        });
 
-        // Publish (even), release: consumer loads with acquire
-        slot.version.store(2 * pos + 2, Ordering::Release);
+        slot.version.store(2 * pos + 2, Ordering::Release); // publish in even
     }
 
     /// Current producer position
@@ -87,7 +113,7 @@ impl<T: Copy + Send> SpmcSender<T> {
     }
 }
 
-/// Sync, clone factory for receivers in `DaemonState`
+/// Sync, Clone factory for receivers, lives in `DaemonState`, call `subscribe()`
 pub struct SpmcSubscriber<T: Copy> {
     buffer: Arc<RingBuffer<T>>,
 }
@@ -99,43 +125,41 @@ impl<T: Copy> Clone for SpmcSubscriber<T> {
 }
 
 impl<T: Copy + Send> SpmcSubscriber<T> {
-    /// New receiver positioned at the current producer cursor, see only events published after
+    /// New receiver pos at current producer cursor
     pub fn subscribe(&self) -> SpmcReceiver<T> {
         let pos = self.buffer.producer.value.load(Ordering::Relaxed);
         SpmcReceiver { buffer: Arc::clone(&self.buffer), pos }
     }
 }
 
-/// Single consumer with own read cursor
+/// A single consumer with its own read cursor
 pub struct SpmcReceiver<T: Copy> {
     buffer: Arc<RingBuffer<T>>,
-    pos: usize,
+    pos:    usize,
 }
 
-impl<T: Copy + Send> SpmcReceiver<T> {
-    /// Return the next event if read, else `None`, no blocking
+impl<T: Copy> SpmcReceiver<T> {
+    /// Return the next event if ready, else `None`, non-blocking
     pub fn try_recv(&mut self) -> Option<T> {
         let buffer = &*self.buffer;
         let slot = &buffer.slots[self.pos & buffer.mask];
-        let want = 2 * self.pos + 2;
 
-        // acquire: sync with producer's closing relase store
-        let v1 = slot.version.load(Ordering::Acquire);
+        let want = 2 * self.pos + 2; // completed at even version
+
+        let v1 = slot.version.load(Ordering::Acquire); // sync with producer's closing Release store
         if v1 < want {
             return None;
         }
         if v1 > want {
-            self.catch_up();
+            self.catch_up(); // producer lapped, loss event, re-sync
             return None;
         }
 
-        let data = unsafe { (*slot.data.get()).assume_init() };
+        let data = slot.data.with(|ptr| unsafe { (*ptr).assume_init() }); // v1 == want
 
-        // acquire fence: prevents v2 load from being re-ordered before the payload copy
-        fence(Ordering::Acquire);
+        fence(Ordering::Acquire); // prevent v2 load from being reordered
         let v2 = slot.version.load(Ordering::Relaxed);
-
-        if v1 != v2 { // producer overwrote the slot during copy, discard
+        if v1 != v2 {
             return None;
         }
 
@@ -143,7 +167,7 @@ impl<T: Copy + Send> SpmcReceiver<T> {
         Some(data)
     }
 
-    /// Resync after being lapped, jump half a buffer back from producer
+    /// Re-sync after being lapped, jump half a buffer back from producer
     fn catch_up(&mut self) {
         let producer_pos = self.buffer.producer.value.load(Ordering::Relaxed);
         let capacity = self.buffer.mask + 1;
@@ -151,35 +175,35 @@ impl<T: Copy + Send> SpmcReceiver<T> {
     }
 }
 
-/// Build a SPMC broadcast channel, `capacity` is rounded up to next power of 2
+/// Build an SPMC broadcast channel, `capacity` round up to next power of 2
 pub fn channel<T: Copy>(capacity: usize) -> (SpmcSender<T>, SpmcSubscriber<T>) {
     let capacity = capacity.next_power_of_two().max(2);
 
     let slots: Box<[Slot<T>]> = (0..capacity)
         .map(|i| Slot {
             version: AtomicUsize::new(2 * i),
-            data: UnsafeCell::new(MaybeUninit::uninit()),
+            data:    UnsafeCell::new(MaybeUninit::uninit()),
         })
         .collect();
 
     let buffer = Arc::new(RingBuffer {
-        mask: capacity - 1,
+        mask:     capacity - 1,
         slots,
         producer: PaddedCursor { value: AtomicUsize::new(0) },
     });
 
     let sender = SpmcSender {
-        buffer: Arc::clone(&buffer),
-        _not_sync: PhantomData
+        buffer:     Arc::clone(&buffer),
+        _not_sync:  std::marker::PhantomData,
     };
-
     let subscriber = SpmcSubscriber { buffer };
 
     (sender, subscriber)
 }
 
-// tests
-#[cfg(test)]
+// normal tests
+
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
@@ -210,7 +234,7 @@ mod tests {
         let (tx, sub) = channel::<u64>(8);
         tx.send(1);
         tx.send(2);
-        let mut rx = sub.subscribe();
+        let mut rx = sub.subscribe(); // subscribe at pos 2
         assert_eq!(rx.try_recv(), None);
         tx.send(3);
         assert_eq!(rx.try_recv(), Some(3));
@@ -223,7 +247,6 @@ mod tests {
         for i in 0..10_u64 {
             tx.send(i);
         }
-        // first read sees v1 > want, trigger catch_up to 10 - 4/2 = 8
         assert_eq!(rx.try_recv(), None);
 
         let mut got = Vec::new();
@@ -234,6 +257,17 @@ mod tests {
             assert!(w[0] < w[1]);
         }
         assert!(got.iter().all(|&v| v >= 8), "got: {got:?}");
+    }
+
+    #[test]
+    fn subscribe_pas_last_write_is_none() {
+        let (tx, sub) = channel::<u64>(4);
+        tx.send(10);
+        tx.send(20);
+        tx.send(30);
+
+        let mut tx = sub.subscribe(); // at pos = 3, never written
+        assert_eq!(tx.try_recv(), None);
     }
 
     #[test]
@@ -273,5 +307,50 @@ mod tests {
             assert!(w[0] < w[1], "order violated: {} then {}", w[0], w[1]);
         }
         assert!(seen.iter().all(|&v| v < n));
+    }
+}
+
+// loom model-checked tests (ONLY run under --cfg loom)
+// Invocation:
+//   LOOM_MAX_PREEMPTIONS=3 cargo test --release --features loom --lib broadcast::loom_tests
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use loom::thread;
+
+    const SENTINEL_A: u64 = 0x1111_1111_1111_1111;
+    const SENTINEL_B: u64 = 0x2222_2222_2222_2222;
+    const SENTINEL_C: u64 = 0x3333_3333_3333_3333;
+
+    #[test]
+    fn seqlock_never_returns_torn_or_stale_data() {
+        loom::model(|| {
+            let (tx, sub) = channel::<u64>(2);
+            let mut rx = sub.subscribe();
+
+            let producer = thread::spawn(move || {
+                tx.send(SENTINEL_A);
+                tx.send(SENTINEL_B);
+                tx.send(SENTINEL_C);
+            });
+
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                if let Some(v) = rx.try_recv() {
+                    seen.push(v);
+                }
+            }
+
+            producer.join().unwrap();
+
+            let valid = [SENTINEL_A, SENTINEL_B, SENTINEL_C];
+            assert!(
+                seen.iter().all(|v| valid.contains(v)),
+                "torn or invalid value present: {seen:x?}"
+            );
+            for pair in seen.windows(2) {
+                assert!(pair[0] < pair[1], "order violated: {:x} then {:x}", pair[0], pair[1]);
+            }
+        });
     }
 }
