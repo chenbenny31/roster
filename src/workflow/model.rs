@@ -115,6 +115,38 @@ impl JobState {
             _ => None,
         }
     }
+
+    /// Compact numeric code from SPMC wire event
+    /// for ring buffer's word-wise atomic read/write, #[repr(C)] struct of u64, zero padding
+    pub fn to_code(&self) -> u64 {
+        match self {
+            JobState::Pending     => 0,
+            JobState::Queued      => 1,
+            JobState::Running     => 2,
+            JobState::Succeeded   => 3,
+            JobState::Failed      => 4,
+            JobState::Skipped     => 5,
+            JobState::Cancelled   => 6,
+            JobState::TimedOut    => 7,
+            JobState::Interrupted => 8,
+        }
+    }
+
+    /// Inverse of to_code(), used by JobEvent::state() to decode the wire event
+    pub fn from_code(code: u64) -> Option<Self> {
+        match code {
+            0 => Some(JobState::Pending),
+            1 => Some(JobState::Queued),
+            2 => Some(JobState::Running),
+            3 => Some(JobState::Succeeded),
+            4 => Some(JobState::Failed),
+            5 => Some(JobState::Skipped),
+            6 => Some(JobState::Cancelled),
+            7 => Some(JobState::TimedOut),
+            8 => Some(JobState::Interrupted),
+            _ => None,
+        }
+    }
 }
 
 impl Serialize for JobState {
@@ -131,21 +163,28 @@ impl<'de> Deserialize<'de> for JobState {
     }
 }
 
-/// Derive run state from an iterator of job states
+/// Derive run state from an iterator of job states, load-bearing order check
+/// - In-memory: `WorkflowRun::state()` calls this over `self.jobs.values()`
+/// - SQL: `RunStore::list_runs`/`get_run` call this over job rows fetched via JOIN
 pub fn derive_run_state(states: impl Iterator<Item = JobState>) -> RunState {
     let states: Vec<JobState> = states.collect();
+    // Failed/TimedOut/Interrupted -> RunState::Failed
     if states.iter().any(|s| matches!(s, JobState::Failed | JobState::TimedOut | JobState::Interrupted)) {
         return RunState::Failed;
     }
+    // Cancelled -> RunState::Cancelled
     if states.iter().any(|s| matches!(s, JobState::Cancelled)) {
         return RunState::Cancelled;
     }
+    // Running/Queued -> RunState::Running
     if states.iter().any(|s| matches!(s, JobState::Running | JobState::Queued)) {
         return RunState::Running;
     }
+    // non-empty, all Succeeded/Skipped -> RunState::Succeeded
     if !states.is_empty() && states.iter().all(|s| matches!(s, JobState::Succeeded | JobState::Skipped)) {
         return RunState::Succeeded;
     }
+    // otherwise (including empty) -> RunState::Pending
     RunState::Pending
 }
 
@@ -363,5 +402,28 @@ jobs:
     fn derive_run_state_partial_flush_is_not_succeeded() {
         let partial = vec![JobState::Succeeded];
         assert_eq!(derive_run_state(partial.into_iter()), RunState::Succeeded);
+    }
+
+    #[test]
+    fn every_job_state_roundtrips_through_code() {
+        for state in ALL_JOB_STATES {
+            let code = state.to_code();
+            assert_eq!(JobState::from_code(code), Some(state));
+        }
+    }
+
+    #[test]
+    fn from_code_rejects_out_of_range() {
+        assert_eq!(JobState::from_code(9), None);
+        assert_eq!(JobState::from_code(999), None);
+    }
+
+    #[test]
+    fn all_job_state_codes_are_distinct() {
+        let codes: Vec<u64> = ALL_JOB_STATES.iter().map(|s| s.to_code()).collect();
+        let mut sorted = codes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), codes.len(), "duplicate JobState code found: {codes:?}");
     }
 }

@@ -40,12 +40,12 @@ async fn flush_transitions(state: &Arc<DaemonState>,
         if let Some(run) = runs.get(run_id) {
             if let Some(job) = run.jobs.get(job_id) {
                 let _ = state.store.upsert_job(run_id, job).await;
-                event_sender.send(JobEvent::StateChanged {
-                    run_seq:    run.run_seq,
-                    job_seq:    job.job_seq,
-                    new_state:  job.state,
-                    emitted_at: monotonic_raw_ns(),
-                });
+                event_sender.send(JobEvent::new(
+                    run.run_seq,
+                    job.job_seq,
+                    job.state,
+                    monotonic_raw_ns(),
+                ));
             }
         }
     }
@@ -319,4 +319,3 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
 
     flush_transitions(state, event_sender, &to_write).await;
 }
-
