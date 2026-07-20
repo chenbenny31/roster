@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [features]
 nvml = []
+loom = ["dep:loom"]
 
 [dependencies]
 anyhow = "1"
@@ -27,3 +28,6 @@ chrono = { version = "0.4", features = ["serde"]}
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
+loom = { version = "0.7", optional = true }
+hdrhistogram = "7"
+core_affinity = "0.8"

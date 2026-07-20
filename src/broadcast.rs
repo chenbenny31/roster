@@ -128,7 +128,7 @@ impl<T: Copy + WordSafe + Send> SpmcSubscriber<T> {
     /// New receiver pos at current producer cursor
     pub fn subscribe(&self) -> SpmcReceiver<T> {
         let pos = self.buffer.producer.value.load(Ordering::Relaxed);
-        SpmcReceiver { buffer: Arc::clone(&self.buffer), pos }
+        SpmcReceiver { buffer: Arc::clone(&self.buffer), pos, laps: 0 }
     }
 }
 
@@ -136,6 +136,7 @@ impl<T: Copy + WordSafe + Send> SpmcSubscriber<T> {
 pub struct SpmcReceiver<T: Copy + WordSafe> {
     buffer: Arc<RingBuffer<T>>,
     pos:    usize,
+    laps:   u64,
 }
 
 impl<T: Copy + WordSafe + Send> SpmcReceiver<T> {
@@ -174,9 +175,14 @@ impl<T: Copy + WordSafe + Send> SpmcReceiver<T> {
 
     /// Re-sync after being lapped, jump half a buffer back from producer
     fn catch_up(&mut self) {
+        self.laps += 1;
         let producer_pos = self.buffer.producer.value.load(Ordering::Relaxed);
         let capacity = self.buffer.mask + 1;
         self.pos = producer_pos.saturating_sub(capacity / 2);
+    }
+
+    pub fn lap_count(&self) -> u64 {
+        self.laps
     }
 }
 
