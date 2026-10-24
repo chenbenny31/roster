@@ -51,7 +51,7 @@ fn discover_gpus() -> Vec<GpuInfo> {
                             tracing::warn!(?error, index, "failed to query GPU");
                         }
                         Ok(device) => {
-                            let name = device.name().unwrap_or_else(|| "unknown".into());
+                            let name = device.name().unwrap_or_else(|_| "unknown".into());
                             let vram_mb = device.memory_info()
                                 .map(|info| info.total / 1024 / 1024)
                                 .unwrap_or(0);

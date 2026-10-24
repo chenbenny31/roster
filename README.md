@@ -1,44 +1,35 @@
 # Roster
 
-**Compute infrastructure and workload scheduling in Rust.**
+Roster runs your commands on a small pool of Linux machines with GPUs. You submit an ordinary command such as `python train.py`. Roster queues it, picks a machine and GPUs that are free, runs it, keeps its logs, and tells you when something needs your attention. Training, batch inference, evaluation, and data processing all use the same path.
 
-Roster is a Rust execution runtime being developed to make CPU and GPU workloads
-easy to run across available machines. Its design centers on a lightweight daemon:
-submit an ordinary command, let Roster choose when and where it runs, and receive
-actionable notifications when something goes wrong. Training, batch inference,
-data processing, and other command-line workloads share the same scheduling core.
+**Why Roster.** With a handful of GPU machines, the usual options sit at two extremes. Running jobs by hand over SSH means checking `nvidia-smi`, picking free GPUs yourself, and noticing failures late. Cluster schedulers such as Slurm or Kubernetes handle placement but expect cluster administration, job scripts, or containers. Roster fills the gap between them: one daemon, machines you already reach over SSH, no job files or SDK, and a queue that places work automatically.
 
-**Status:** the repository contains a single-node workflow prototype and a
-benchmarked event-broadcast component. The controller/worker architecture,
-multi-node scheduling, and command-first interface below are **proposed, not
-implemented**. The sections below describe the intended architecture and delivery
-plan; the current prototype and its limitations are documented separately below.
+Roster is also careful with shared hardware. A GPU goes to the next job only after the previous job's processes are verified gone, and a job is never started twice after a crash or a lost message.
 
-## Intended experience
+Roster is in early development; the [roadmap](#roadmap) shows what works today.
 
-Proposed CLI, not commands available in the current prototype:
+## Usage
 
 ```bash
-roster run -- python train.py
-roster run -- python infer.py --input batch-a.jsonl
-roster jobs
+roster run -- python train.py               # returns a job ID once the job is stored
+roster run --gpus 4 -- torchrun --standalone --nproc-per-node=4 train.py
+roster jobs [--json]
 roster show JOB_ID
-roster next JOB_ID
-roster cancel JOB_ID
+roster explain JOB_ID                       # why it waits, from the scheduler's own decision
+roster logs JOB_ID [--attempt N] [--follow]
+roster next JOB_ID                          # move to the front; never kills running work
+roster cancel JOB_ID                        # returns once the stop is stored, completes after cleanup
+roster retry JOB_ID                         # failed jobs wait for this
+roster node add SSH_ALIAS
+roster nodes
+roster node drain NODE_ID
 ```
 
-No SDK or mandatory workflow file. A default execution profile supplies resource
-and environment settings, with explicit overrides when needed. Roster places
-each job on a compatible node and selects its GPUs. Users can inspect the command,
-placement, logs, and known failure facts without watching every successful event.
+A default profile per queue or workspace supplies resources, environment, and paths, and flags such as `--gpus` override it. Commands run as argv without a shell, with the working directory mapped through the node's profile, stdin from `/dev/null`, and only selected environment variables. Every request carries an ID, so resending after a lost reply returns the original job. Workflow files with dependencies stay available as optional input.
 
-`next` promotes waiting work; it does not interrupt a running job. Cancellation
-stops managed work and waits for verified cleanup before reclaiming resources.
-Genuine workload failures require a user-directed retry by default. Roster does
-not automatically parallelize a command, install its environment, or provision
-machines. See the [product contract](docs/roster-v2-design.md#product-contract).
+Normal events are recorded without alerts. A failure that needs action becomes an issue with the known facts and suggested actions.
 
-## Core design
+## Design
 
 ```text
 CLI → controller: durable queue → first-fit placement → identified allocation
@@ -50,157 +41,133 @@ CLI → controller: durable queue → first-fit placement → identified allocat
                    CPU / RAM / GPUs                            CPU / RAM / GPUs
 ```
 
-- **One queue, deterministic placement.** Queue policy chooses eligible work;
-  first-fit selects the first compatible node with the complete requested resource
-  set. Protection for older waiting jobs bounds bypass while allowing other work
-  to use surplus resources. Unreachable capacity is not treated as free capacity.
-- **One worker per node, many concurrent jobs.** Local and remote workers use the
-  same execution contract. A worker validates assignments, manages processes,
-  reports observations, and proves cleanup; it does not independently reorder the
-  global queue or implement GPU kernel scheduling.
-- **Explicit ownership.** Requirements describe what a job needs; durable claims
-  identify its reserved resources; backend controls describe what is actually
-  enforced. CPU/RAM budgets are not hard limits, and a VRAM reservation is not a
-  guarantee of GPU compute fairness. Initial GPU delivery uses exclusive devices.
-- **Recoverable lifecycle.** Prepare reserves and validates without starting user
-  code. Activation permits launch once; cancellation closes that permission.
-  Resources are released only after workload cleanup and device readiness are
-  established. A lost heartbeat alone never permits release or duplicate launch.
-- **Durable controller and worker state.** The proposed SQLite-backed controller
-  records job intent, placement, and pending commands. Each worker keeps a local
-  SQLite-backed journal of accepted allocations, launch permission, stop intent,
-  and cleanup evidence. Recovery reconciles these records with managed processes;
-  database transactions alone cannot make process launch atomic. See
-  [persistence and journals](docs/roster-v2-design.md#persistence).
-- **Useful observability.** Durable state explains ownership and decisions;
-  logs, metrics, and events explain behavior. The broadcast ring carries telemetry,
-  not authoritative state. Process launch and application readiness are separate
-  facts, especially for inference servers.
+One controller owns the queue and placement. One worker per node owns local admission, processes, logs, and cleanup, and it runs many jobs at once. On a single machine both live in one daemon. The controller reaches workers through SSH tunnels, and closing a tunnel doesn't stop jobs.
 
-The [command core](docs/roster-v2-design.md#command-core),
-[worker contract](docs/roster-v2-design.md#cluster-worker), and
-[resource contract](docs/roster-v2-design.md#resource-contract) define these
-boundaries, including how future backends preserve resource ownership and recovery.
+**Identities.** A **job** is what you submit, inspect, cancel, and retry; its spec never changes. An **attempt** is one try of the whole job, and a retry creates a new one. An **execution** is one node's part of an attempt. An **allocation** is the exact CPU/RAM budget and GPU UUIDs an execution holds. Because messages name their allocation, a late "exited" report can't free resources that now belong to another job. An attempt holds a list of executions: one for now, several for coordinated jobs later.
 
-### From submission to cleanup
+**Launch once.** A database commit and a process start can't be atomic, so starting takes four steps:
 
-A job is the unit the user submits, inspects, cancels, and retries. Workflow
-dependencies can order several jobs, but an ordinary command does not need a
-workflow wrapper. The controller separates queue order from placement: it first
-chooses eligible work, then finds a node that can satisfy the complete request.
+1. The controller stores the attempt and its allocations in one transaction.
+2. **Prepare:** the worker rechecks its inventory, records the holds with a closed launch gate, and starts a runner inside a systemd service (cgroup v2). No user code runs yet.
+3. **Activate:** once every execution reports Prepared, the controller commits activation and the worker opens the gate.
+4. The runner gets permission exactly once. The worker records it as issued before handing it over and never issues it again. If delivery is uncertain, the outcome is `outcome_unknown` instead of a second launch.
 
-The planned execution lifecycle is:
+A stop closes the gate on disk first, even when it arrives before Prepare.
 
-1. **Reserve:** record the selected node and resources durably; the worker checks
-   local capacity and accepts ownership of the allocation.
-2. **Prepare:** establish the managed process boundary and execution environment
-   without running the user's command.
-3. **Activate:** authorize that prepared command to start once, then report its
-   observed state and capture logs locally.
-4. **Reconcile:** after a restart or disconnect, compare durable intent with local
-   execution evidence before deciding what can run next.
-5. **Release:** confirm that managed descendants have stopped and the resource
-   backend is ready before making the allocation available again.
+**Release only with proof.**
 
-Cancellation closes launch permission before cleanup. Missing contact leaves
-ownership unresolved; it does not mean the job stopped. These rules apply to
-local and remote execution alike. Application readiness, such as an inference
-server becoming ready to accept requests, is a separate future capability.
+```text
+may_release(allocation) =
+    launch gate closed
+    AND managed process tree empty           (cgroup populated=0)
+    AND GPU checks pass                      (same UUIDs, NVML queries OK, no stray contexts)
+    AND release recorded by the worker
+```
 
-### Adding machines
+Child exit, `ECHILD`, a lost heartbeat, or a timeout never count as proof. If cleanup times out, the allocation is quarantined.
 
-The planned enrollment flow uses an existing SSH connection to a prepared machine.
-Each worker reports its identity, available resources, and supported execution
-profiles. A profile describes the runtime and workspace needed by a command;
-placement must check compatibility as well as free capacity.
+**Durable state.** The controller and every worker keep SQLite with WAL and `synchronous=FULL`. Nothing is acknowledged before it commits. A failed write stops new admission and keeps known allocations held. Workers keep their journal on local disk and keep managing their jobs while the controller is down.
 
-A single-machine installation uses the same controller/worker structure as a
-larger installation. Adding workers expands the pool for waiting jobs. Draining a
-node prevents new assignments while allowing accepted work to finish. During a
-controller disconnect, workers retain local process management and recording;
-new placement waits for the controller. Enrollment does not install drivers or
-silently change the machine's environment.
+**Queue and placement.** There is one FIFO queue. `next` promotes a job, and a bound keeps promoted jobs from starving the oldest waiting one. Placement is first-fit over a fixed node order: the first node that fits the whole request (CPU, RAM, and the full GPU set) wins. A job never combines GPUs from two machines. An older job that can't fit yet gets a **ticket** on a node, so younger jobs only use spare resources there until it fits. Busy or disconnected nodes mean the job waits; Roster rejects a job only when known capacity could never fit it. `explain` reads the same decision the scheduler made:
 
-## Workload scope
+```text
+Job 42 is waiting for a GPU.
+Job 17 is stopping and has not released it yet.
+Roster will start this job when cleanup is confirmed.
+```
 
-| Scenario | Design path |
+**Resources.** A requirement ("one GPU with at least 24 GB"), the claim placement makes (that GPU's UUID), and what the backend enforces are kept separate. GPUs start as exclusive whole devices, and `CUDA_VISIBLE_DEVICES` gets their UUIDs.
+
+**Unknown stays unknown.** A disconnected node isn't treated as empty, a missing result isn't success, and uncertain work is never started again elsewhere. After any restart, Roster loads unreleased allocations before computing free capacity and then reconciles each worker. Retries are explicit; Roster re-places a job on its own only when it can prove no execution ever got launch permission.
+
+## APIs
+
+Each worker exposes the same operations:
+
+| Operation | Contract |
 | --- | --- |
-| CPU jobs, training, batch inference | Ordinary command on one selected node |
-| One job using several GPUs | Reserve its complete GPU set on one node; the application uses those devices |
-| Many jobs across machines | Shared queue assigns independent jobs to workers |
-| Long-running inference server | Managed command initially; readiness, routing, and replica ownership are later extensions |
-| One coordinated job spanning nodes | Later group preparation, launcher/rendezvous integration, and whole-group recovery |
-| Several jobs sharing a GPU | Separate extension with explicit admission, enforcement, fairness, and cleanup validation |
+| Describe | Node identity, allocatable CPU/RAM, GPU UUIDs and health, runtime profiles |
+| Prepare | Reserve all local resources or reject; the gate stays closed |
+| Activate | Open the gate for a matching preparation |
+| Stop | Close the gate on disk, clean up, report release separately |
+| Sync | Versioned snapshot after reconnect |
+| Logs | Stream by execution and offset; recording continues while disconnected |
 
-The first multi-node milestone distributes independent jobs, with each job fitting
-entirely on one node. A command that already supports multiple local GPUs can use
-a complete device allocation after that path is validated.
+Messages carry a protocol version, request ID, and the IDs they act on. A worker rejects an unknown required field or mode instead of ignoring it, so a multi-node job can't silently run on one node.
 
-Coordinated workloads are a later extension: one job requests a fixed group of
-nodes, all members prepare before activation, and a launcher configures their
-communication. A member failure triggers group cleanup; a retry waits until the
-previous group is fully reclaimed. Independent inference replicas instead belong
-to separate jobs, with future service policy managing their readiness and count.
+A job request separates the resource shape from how the program is launched:
 
-CUDA execution belongs to the workload; NVML supplies GPU discovery and health
-evidence. NCCL, RDMA, and NUMA are optional integration concerns in later stages,
-not requirements for distributing independent jobs. Multiple GPUs do not imply
-RDMA, and memory on different devices is not automatically pooled. Hardware paths
-need their own validation; see [AI infrastructure coverage](docs/roster-v2-design.md#ai-infrastructure).
+```rust
+struct JobSpec {
+    shape: JobShape,
+    launcher: LauncherSpec,            // Command now, Torchrun later
+    environment: ProfileRef,
+    placement: PlacementRequirements,
+}
+
+struct JobShape {
+    nodes: NonZeroU16,
+    per_node: LocalRequirements,       // CPU/RAM budgets, GPU count and minimum memory
+}
+```
+
+1×0 is a CPU job, 1×4 is four GPUs on one node, and 2×4 is eight GPUs across two nodes. The first release accepts only `nodes = 1`.
+
+## Event broadcast
+
+The scheduler publishes job events through an in-process single-producer, multi-consumer ring ([broadcast.rs](src/broadcast.rs)) that IPC handlers subscribe to. It carries telemetry only: control messages never use it, and a consumer that falls a full lap behind reloads a snapshot.
+
+Each slot is a seqlock whose payload sits in per-word `Relaxed` atomics. The first version stored it in `UnsafeCell<MaybeUninit<T>>`, and loom showed that a reader racing the writer on that cell is undefined behavior even when the version check throws the value away (Boehm, "Can Seqlocks Get Along with Programming Language Memory Models?", MSPC 2012). Slots are cache-line aligned and the sender is `!Sync`.
+
+p99 latency at 100K events/s, three unpinned runs:
+
+| Subscribers | Intel Lunar Lake, 8 cores | AMD Ryzen 9 9900X, 24 threads |
+|---|---|---|
+| 1 | 129–131 ns | 80–90 ns |
+| 2 | 154–159 ns | 210–311 ns |
+| 4 | 976–1,215 ns | 170–180 ns |
+| 7 | one run lapped; others 5.8 μs and 262 μs | 481–722 ns |
+
+- Any lap invalidates a run. 64 subscribers lapped in every run on both machines, and 23 subscribers lapped in two of three runs on the Ryzen.
+- Pinning threads to cores (`--pin`) made p50 and p99 3–12× worse on Lunar Lake, so unpinned is the default.
+- 100K events/s is a stress load, far above a scheduler's real rate of about 1–100 events/s. The numbers cover the ring alone, without scheduling, IPC, or SQL.
+
+Timing uses `CLOCK_MONOTONIC_RAW` and an HDR histogram with up to 1M samples per configuration after warmup. Reproduce with `cargo run --locked --release --bin bench_broadcast`, adding `-- --pin` for the pinning run.
+
+## Scope
+
+Supported: 64-bit Linux, NVIDIA GPUs with drivers and runtimes already installed, and one user or mutually trusted users per installation. One controller runs the cluster, with no HA.
+
+Roster won't:
+
+- Parallelize a program, split datasets, or merge outputs.
+- Copy code or data to nodes, install environments, or provision machines. A profile maps paths per node and is checked before launch.
+- Enforce CPU, RAM, or VRAM limits. Those numbers are admission budgets.
+- Clean up work a job hands off outside its process tree, for example over SSH or to a container daemon.
+
+Not planned for the first release: checkpoint or migration, MIG/MPS, isolation between untrusted users, container orchestration, an RDMA runtime, and a web dashboard.
 
 ## Roadmap
 
-No implementation stage below is complete. Stage IDs match the canonical design;
-**S5 precedes S4** because multi-node placement comes before optional preemption.
+S5 comes before S4 because multi-node placement matters more than preemption.
 
-| Order | Stage | Delivery gate |
+| Stage | Delivers | Status |
 | --- | --- | --- |
-| 1 | S0 — validation preparation | Finalize core contracts and establish reproducible builds |
-| 2 | S1 — scheduling core | Durable job/allocation model, typed resources, first-fit, and bounded queue bypass |
-| 3 | S2 — reliable local execution | CPU process ownership, cancellation, cleanup, and restart reconciliation |
-| 4 | S3 — GPU execution | NVML/UUID identity and exclusive GPU ownership; validate local multi-GPU separately |
-| 5 | S5 — shared multi-node queue | Node enrollment, compatible execution profiles, reusable workers, and partition recovery |
-| 6 | S6 — user experience | Simple onboarding, job explanations, log following, and actionable error notifications |
+| **S0** | **Single-node prototype: YAML workflows with dependencies, CPU/RAM/VRAM budgets, first-fit GPU selection, shell processes, SQLite status, locked build** | **Current** |
+| S1 | Job/attempt/execution/allocation model, FIFO with promotion and tickets, first-fit, typed claims, request IDs | Next |
+| S2 | Reliable local execution: runner, launch gate, systemd service, cancel, deadlines, restart recovery | Planned |
+| S3 | GPUs by UUID, exclusive allocation, release checks on real hardware | Planned |
+| S5 | Shared queue across nodes: enrollment, drain, profiles, reconciliation; CPU-only can follow S2 | Planned |
+| S4 | Opt-in preemption of restartable GPU jobs (`preempt=restart`, minimum runtime, once per job) | Planned |
+| S6 | CLI polish, notifications, log following | Planned |
+| S7 | Coordinated multi-node jobs with Torchrun: whole-bundle reservation, group start, stop, and retry, rendezvous per attempt | Planned |
+| S8 | RDMA, GPUDirect, and NUMA/topology placement on tested hardware | Planned |
+| S9 | Checkpoint resume, elasticity, service replicas, and roles, each with its own design | Planned |
 
-User experience is part of every stage. CPU-only multi-node work can follow S2
-without waiting for GPU hardware validation.
-
-Later branches extend the same ownership and lifecycle contracts:
-
-- **S4:** optional interruption/restart of explicitly eligible jobs.
-- **After S3:** validated shared-GPU modes, independent of distributed training.
-- **S7:** fixed coordinated groups, beginning with a selected training launcher.
-- **S8:** verified topology, NUMA, and RDMA/GPUDirect paths on supported hardware.
-- **S9:** service/replica ownership, roles, checkpointing, and elasticity as
-  separately scoped extensions. Serving features need not wait for S7 or RDMA.
-
-See the [full roadmap and extension gates](docs/roster-v2-design.md#roadmap).
-
-## Current prototype
-
-The existing code accepts YAML workflows and schedules a dependency DAG locally.
-It includes CPU/RAM budget accounting, per-GPU VRAM admission and first-fit
-selection, shell subprocesses with process groups and file logs, SQLite status
-records, and Unix-domain IPC. These are foundations, not the proposed worker's
-recovery and enforcement guarantees.
-
-Known limitations:
-
-- Default discovery returns CPU/RAM inventory and no GPUs. The optional NVML
-  code path references a dependency absent from the manifest.
-- CLI `cancel` is unimplemented. `logs` returns a file path, not a live stream.
-- Restart handling marks recorded running jobs interrupted; it does not recover
-  durable resource ownership or reconstruct the proposed queue.
-- Process-group execution and declared budgets do not establish reliable
-  descendant cleanup or enforced resource isolation.
-
-See [implementation findings](docs/roster-v2-design.md#findings) for details.
-
-### Existing interface
-
-With a prepared prototype binary, the existing interface is:
+The S0 prototype uses its own commands:
 
 ```bash
+cargo build --locked                 # add --features nvml for NVIDIA discovery
 roster daemon
 roster submit examples/cpu-only.yaml
 roster ps
@@ -208,114 +175,9 @@ roster status <run-id>
 roster logs <run-id>/<job-id>
 ```
 
-The [CPU-only example](examples/cpu-only.yaml) shows the current YAML format.
-`gpu` is a device count and `vram_mb` is a per-device admission budget; CPU-only
-jobs use `gpu: 0`. These fields describe the prototype, not the proposed typed
-resource contract.
+Shared GPUs are a separate branch after S3, for example an 8 GB and a 2 GB job on one 16 GB card. They need per-job claims and a validated backend (budgets, MPS, or MIG). A memory split says nothing about compute share.
 
-Reproducible build setup is still pending. See the
-[development validation plan](docs/roster-v2-design.md#validation) for lockfile
-setup and build commands.
-
-<a id="recorded-benchmarks"></a>
-
-## Broadcast latency
-
-Historical measurements of the single-producer, multiple-consumer (SPMC) ring:
-**131 ns p99 with one subscriber; 159 ns with two**, at 100K events/sec.
-The benchmark measures synthetic publication and consumption through
-`broadcast::channel`; scheduling, IPC, SQL, and process launch are outside the
-measurement. See the [benchmark evidence](docs/roster-v2-design.md#recorded-benchmarks)
-for provenance and reproduction status.
-
-**Why per-word atomics, not `UnsafeCell`:** the original implementation
-stored each slot's payload in `UnsafeCell<MaybeUninit<T>>`. Loom model
-checking found a genuine causality violation — a race between the producer's
-write and a consumer's read of the same cell is undefined behavior the
-instant it occurs, even if the seqlock's version recheck later discards the
-result. The fix (Boehm, "Can Seqlocks Get Along with Programming Language
-Memory Models?", MSPC 2012) moves the payload into real per-word `Relaxed`
-atomics instead, under an unsafe `WordSafe` payload contract. The implementation
-also uses cache-line-isolated slots and a `!Sync` sender. Historical Loom checking
-covered a bounded modeled scenario (`LOOM_MAX_PREEMPTIONS=3`); it is not a universal
-soundness proof. See [broadcast.rs](src/broadcast.rs) and the
-[design notes](docs/roster-v2-design.md#recorded-benchmarks).
-
-**Recorded benchmark machine:** 8-core Intel Lunar Lake (Core Ultra 200V).
-
-### Headline numbers (unpinned, latest recorded of three runs)
-
-| Config | p50 | p99 | p99.9 |
-|---|---|---|---|
-| 1 subscriber, 100K events/sec | 110 ns | 131 ns | 140 ns |
-| 1 subscriber, 1K events/sec (sparse) | 117 ns | 249 ns | 494 ns |
-| 2 subscribers, 100K events/sec | 124 ns | 159 ns | 264 ns |
-| 4 subscribers, 100K events/sec | 383 ns | 1,175 ns | 1.6–11.6 μs\* |
-
-\* p99.9 at 4 subscribers varied 1.6–11.6 μs across three runs. Four subscribers
-means five busy threads (four consumers and one producer); the measurements alone
-do not establish which scheduling or topology effects caused the variation.
-
-**Reproducibility** (p50 / p99 range across three unpinned runs):
-
-| Config | p50 range | p99 range |
-|---|---|---|
-| 1 sub, stress | 110–112 ns | 129–131 ns |
-| 1 sub, sparse | 117–135 ns | 249–354 ns |
-| 2 subs | 121–124 ns | 154–159 ns |
-| 4 subs | 383–586 ns | 976–1,215 ns |
-
-100K events/sec characterizes sustained synthetic traffic, not a measured
-production event rate. The sparse 1K/sec case has higher reported latency;
-cache/coherency explanations remain unverified without supporting traces.
-
-### Saturation boundary: 7 subscribers
-
-Seven subscribers means eight busy-spinning threads. The three recorded unpinned
-runs show substantial tail variation and a lap in one run:
-
-| Run | Lapped? | p99 | p99.9 | Per-consumer p99 spread |
-|---|---|---|---|---|
-| 1 | Once | 1,318 ns | 2.76 ms | 980 ns – 1,367 ns |
-| 2 | No | 5,807 ns | 3.06 ms | 1,441 ns – 194,431 ns |
-| 3 | No | 262,399 ns | 7.47 ms | 1,713 ns – 1,781,759 ns |
-
-The lapped run is invalid under the harness's validity rule. The other two runs
-show that avoiding laps does not ensure low or consistent tail latency. OS
-scheduling is a possible contributor, not a diagnosed cause from these tables.
-
-### Oversubscription: 64 subscribers
-
-65 busy threads on 8 cores. Included deliberately as a demonstration of the
-boundary, not a result: every run laps on every consumer (23–81 times
-each), p50 in the 8-millisecond range, consistently and reproducibly
-invalid. This confirms the harness's lap-detection correctly flags an
-invalid run rather than silently reporting corrupted percentiles.
-
-### Core pinning: attempted, rejected
-
-`--pin` assigns each thread to a distinct logical core via `core_affinity`,
-by array index. One pinned run was measured against the unpinned baseline:
-pinning regressed p50/p99 by roughly 3–12× across every stable
-configuration (1/2/4 subscribers), and did not fix the 7-subscriber
-saturation case.
-
-Heterogeneous core placement is an unverified explanation for this regression;
-the recorded experiment does not establish its cause. **Unpinned is the default
-and the reported configuration.**
-
-### Methodology
-
-- **Clock**: `CLOCK_MONOTONIC_RAW` for local elapsed-time measurements.
-- **Histogram**: HDR histogram (`hdrhistogram` crate), 1 ns – 10 s range, 3 significant figures.
-- **Sample counts**: scaled to offered rate, capped at 15s wall-clock per configuration (`min(rate × 15, 1,000,000)` measured samples, `min(rate, 10,000)` warmup samples discarded per-consumer) — a fixed sample count that's ~10s at 100K/sec becomes ~17 minutes at 1K/sec otherwise.
-- **Termination**: producer-done signal plus drain-to-empty, not a send-count comparison — a lapped consumer permanently skips events by design, so count-based termination hangs forever on any lapped run.
-- **Validity**: any consumer lapping the ring invalidates that run; flagged automatically, not filtered silently.
-- **Reproducibility**: three unpinned runs per configuration; ranges reported above.
-
-After completing the build setup, run
-`cargo run --frozen --release --bin bench_broadcast` (append `-- --pin` for the
-pinning experiment).
+Open questions: systemd and cgroup support on target machines (S2), whether the launch gate holds at every crash point (S2), how soon a GPU is safe to reuse after cancel (S3), the notification channel (S6), controller capacity (S5), and how group bundles interact with tickets and who owns the rendezvous endpoint (S7).
 
 ## License
 
