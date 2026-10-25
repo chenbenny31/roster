@@ -2,9 +2,13 @@
 
 Roster runs your commands on a small pool of Linux machines with GPUs. You submit an ordinary command such as `python train.py`. Roster queues it, picks a machine and GPUs that are free, runs it, keeps its logs, and tells you when something needs your attention. Training, batch inference, evaluation, and data processing all use the same path.
 
-**Why Roster.** With a handful of GPU machines, the usual options sit at two extremes. Running jobs by hand over SSH means checking `nvidia-smi`, picking free GPUs yourself, and noticing failures late. Cluster schedulers such as Slurm or Kubernetes handle placement but expect cluster administration, job scripts, or containers. Roster fills the gap between them: one daemon, machines you already reach over SSH, no job files or SDK, and a queue that places work automatically.
+**Why Roster.** With a handful of GPU machines, the usual options sit at two extremes. Running jobs by hand over SSH means checking `nvidia-smi`, picking free GPUs yourself, and noticing failures late. Cluster schedulers such as Slurm or Kubernetes handle placement but expect cluster administration: the same accounts and config on every node, job scripts, an accounting database, and a separate monitoring stack to see what each GPU is doing. Roster fills the gap between them:
 
-Roster is also careful with shared hardware. A GPU goes to the next job only after the previous job's processes are verified gone, and a job is never started twice after a crash or a lost message.
+- **One binary per machine.** Every machine runs the same daemon, which finds its own CPUs, memory, and GPUs. `roster node add` registers a machine you already reach over SSH and starts its daemon there. There is no shared filesystem or database server to set up.
+- **One command per job.** `roster run -- python train.py` queues the command as it is. When every node is busy, jobs wait in order and start as soon as resources free up, and a large job can't be starved by a stream of small ones.
+- **Every job visible live.** Each node streams job events and resource use to the controller, so `roster watch` shows which job holds which GPU on which node within milliseconds. A node that goes quiet shows as stale, not idle.
+- **Waiting explained.** `roster explain` reads the scheduler's own decision instead of a reason code.
+- **Safe handover.** A GPU goes to the next job only after the previous job's processes are verified gone, and a job is never started twice after a crash or a lost message.
 
 Roster is in early development; the [roadmap](#roadmap) shows what works today.
 
@@ -14,13 +18,17 @@ Roster is in early development; the [roadmap](#roadmap) shows what works today.
 roster run -- python train.py               # returns a job ID once the job is stored
 roster run --gpus 4 -- torchrun --standalone --nproc-per-node=4 train.py
 roster jobs [--json]
+roster watch                                # live jobs and nodes
 roster show JOB_ID
 roster explain JOB_ID                       # why it waits, from the scheduler's own decision
 roster logs JOB_ID [--attempt N] [--follow]
 roster next JOB_ID                          # move to the front; never kills running work
 roster cancel JOB_ID                        # returns once the stop is stored, completes after cleanup
 roster retry JOB_ID                         # failed jobs wait for this
-roster node add SSH_ALIAS
+roster start                                # on every machine; also stop, restart
+roster enable                               # start at boot and keep running after logout
+roster info [NODE]                          # this machine, or a node as the controller sees it
+roster node add SSH_ALIAS                   # on the controller
 roster nodes
 roster node drain NODE_ID
 ```
@@ -41,7 +49,9 @@ CLI → controller: durable queue → first-fit placement → identified allocat
                    CPU / RAM / GPUs                            CPU / RAM / GPUs
 ```
 
-One controller owns the queue and placement. One worker per node owns local admission, processes, logs, and cleanup, and it runs many jobs at once. On a single machine both live in one daemon. The controller reaches workers through SSH tunnels, and closing a tunnel doesn't stop jobs.
+Every machine runs the same daemon. As a **worker**, it finds its own resources at startup and owns local admission, processes, logs, and cleanup, running many jobs at once. A daemon with registered nodes is also the **controller**, which owns the queue and placement. On a single machine both roles live in one daemon. The controller reaches each worker through one SSH connection that forwards the worker's Unix socket, so there is no network listener to secure, and closing the connection doesn't stop jobs.
+
+**Live state.** Each worker streams its job events and resource samples to the controller: a snapshot first, then batches every 10 ms and a heartbeat every second. A stream that falls behind gets a fresh snapshot. The stream is telemetry only. An exit event makes the controller ask the worker at once, and the worker's reply is what counts. `roster watch` shows every node on the controller and one node on a worker.
 
 **Identities.** A **job** is what you submit, inspect, cancel, and retry; its spec never changes. An **attempt** is one try of the whole job, and a retry creates a new one. An **execution** is one node's part of an attempt. An **allocation** is the exact CPU/RAM budget and GPU UUIDs an execution holds. Because messages name their allocation, a late "exited" report can't free resources that now belong to another job. An attempt holds a list of executions: one for now, several for coordinated jobs later.
 
@@ -68,7 +78,7 @@ Child exit, `ECHILD`, a lost heartbeat, or a timeout never count as proof. If cl
 
 **Durable state.** The controller and every worker keep SQLite with WAL and `synchronous=FULL`. Nothing is acknowledged before it commits. A failed write stops new admission and keeps known allocations held. Workers keep their journal on local disk and keep managing their jobs while the controller is down.
 
-**Queue and placement.** There is one FIFO queue. `next` promotes a job, and a bound keeps promoted jobs from starving the oldest waiting one. Placement is first-fit over a fixed node order: the first node that fits the whole request (CPU, RAM, and the full GPU set) wins. A job never combines GPUs from two machines. An older job that can't fit yet gets a **ticket** on a node, so younger jobs only use spare resources there until it fits. Busy or disconnected nodes mean the job waits; Roster rejects a job only when known capacity could never fit it. `explain` reads the same decision the scheduler made:
+**Queue and placement.** There is one FIFO queue. `next` promotes a job, and a bound keeps promoted jobs from starving the oldest waiting one. Placement is first-fit over a fixed node order: the first node that fits the whole request (CPU, RAM, and the full GPU set) wins. A job never combines GPUs from two machines. Placement runs again as soon as a worker reports an exit, so freed resources don't sit idle. An older job that can't fit yet gets a **ticket** on a node, so younger jobs only use spare resources there until it fits. Busy or disconnected nodes mean the job waits; Roster rejects a job only when known capacity could never fit it. `explain` reads the same decision the scheduler made:
 
 ```text
 Job 42 is waiting for a GPU.
@@ -86,7 +96,7 @@ Each worker exposes the same operations:
 
 | Operation | Contract |
 | --- | --- |
-| Describe | Node identity, allocatable CPU/RAM, GPU UUIDs and health, runtime profiles |
+| Info | Node identity, allocatable CPU/RAM, GPU UUIDs and health, runtime profiles |
 | Prepare | Reserve all local resources or reject; the gate stays closed |
 | Activate | Open the gate for a matching preparation |
 | Stop | Close the gate on disk, clean up, report release separately |
@@ -115,7 +125,7 @@ struct JobShape {
 
 ## Event broadcast
 
-The scheduler publishes job events through an in-process single-producer, multi-consumer ring ([broadcast.rs](src/broadcast.rs)) that IPC handlers subscribe to. It carries telemetry only: control messages never use it, and a consumer that falls a full lap behind reloads a snapshot.
+The scheduler publishes job events through an in-process single-producer, multi-consumer ring ([broadcast.rs](src/broadcast.rs)) that IPC handlers subscribe to. It carries telemetry only: control messages never use it, and a consumer that falls a full lap behind reloads a snapshot. Across machines the ring stays local. Each worker has its own, and its stream to the controller is one more subscriber, so a slow or broken link never makes a worker wait. Over a network, latency comes from the link and the 10 ms batch, not the ring.
 
 Each slot is a seqlock whose payload sits in per-word `Relaxed` atomics. The first version stored it in `UnsafeCell<MaybeUninit<T>>`, and loom showed that a reader racing the writer on that cell is undefined behavior even when the version check throws the value away (Boehm, "Can Seqlocks Get Along with Programming Language Memory Models?", MSPC 2012). Slots are cache-line aligned and the sender is `!Sync`.
 
@@ -153,7 +163,8 @@ S5 comes before S4 because multi-node placement matters more than preemption.
 
 | Stage | Delivers | Status |
 | --- | --- | --- |
-| **S0** | **Single-node prototype: YAML workflows with dependencies, CPU/RAM/VRAM budgets, first-fit GPU selection, shell processes, SQLite status, locked build** | **Current** |
+| S0 | Single-node prototype: YAML workflows with dependencies, CPU/RAM/VRAM budgets, first-fit GPU selection, shell processes, SQLite status, locked build | Done |
+| **P1** | **Multi-node prototype ahead of S1–S5: a daemon on every node, `node add`, one queue across nodes, live node streams, `roster run` and `watch`; no launch gate or restart recovery yet** | **Current** |
 | S1 | Job/attempt/execution/allocation model, FIFO with promotion and tickets, first-fit, typed claims, request IDs | Next |
 | S2 | Reliable local execution: runner, launch gate, systemd service, cancel, deadlines, restart recovery | Planned |
 | S3 | GPUs by UUID, exclusive allocation, release checks on real hardware | Planned |
@@ -164,11 +175,11 @@ S5 comes before S4 because multi-node placement matters more than preemption.
 | S8 | RDMA, GPUDirect, and NUMA/topology placement on tested hardware | Planned |
 | S9 | Checkpoint resume, elasticity, service replicas, and roles, each with its own design | Planned |
 
-The S0 prototype uses its own commands:
+The current prototype uses its own commands:
 
 ```bash
 cargo build --locked                 # add --features nvml for NVIDIA discovery
-roster daemon
+roster start                         # also stop, restart, info
 roster submit examples/cpu-only.yaml
 roster ps
 roster status <run-id>
