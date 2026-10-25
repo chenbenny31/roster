@@ -1,11 +1,14 @@
+use serde::{Deserialize, Serialize};
 use sysinfo::System;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemResources {
     pub cpu_cores: u32,
     pub memory_mb: u64,
     pub gpus: Vec<GpuInfo>, // empty if no NVIDIA driver
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuInfo {
     pub index: u32,
     pub name: String,

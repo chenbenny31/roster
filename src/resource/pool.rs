@@ -1,8 +1,10 @@
+use serde::{Deserialize, Serialize};
+
 use crate::resource::discovery::SystemResources;
 use crate::workflow::spec::ResourceSpec;
 
 /// Concrete allocation produced by try_reserve, passed back to release
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Allocation {
     pub cpu:       u32,
     pub memory_mb: u64,
@@ -10,7 +12,7 @@ pub struct Allocation {
 }
 
 /// A single GPU slow within an allocation, records index and VRAM reserved
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuAllocation {
     pub index:   u32,
     pub vram_mb: u64,
@@ -41,6 +43,18 @@ impl ResourcePool {
         self.try_find_gpus(spec).is_some()
             && self.available_cpu       >= spec.cpu
             && self.available_memory_mb >= spec.memory_mb
+    }
+
+    /// Whether the job could ever fit here, compared against totals rather than free resources
+    pub fn could_fit(&self, spec: &ResourceSpec) -> bool {
+        let matching_gpus = self.total.gpus
+            .iter()
+            .filter(|gpu| gpu.vram_mb >= spec.vram_mb)
+            .count();
+
+        self.total.cpu_cores >= spec.cpu
+            && self.total.memory_mb >= spec.memory_mb
+            && matching_gpus >= spec.gpu as usize
     }
 
     /// Atomically check and reserve resource, returns None if admission fails
@@ -177,5 +191,14 @@ mod tests {
         assert_eq!(alloc.gpus.len(), 2);
         assert_eq!(alloc.gpus[0].index, 0);
         assert_eq!(alloc.gpus[1].index, 1);  // first-fit picks 0 and 1
+    }
+
+    #[test]
+    fn could_fit_compares_totals_not_free_resources() {
+        let mut pool = make_pool(4, 8_000, vec![gpu(0, 8_000), gpu(1, 16_000)]);
+        pool.try_reserve(&gpu_spec(4, 8_000, 1, 16_000)).unwrap();
+        assert!(pool.could_fit(&gpu_spec(4, 8_000, 1, 16_000))); // busy now, fits later
+        assert!(!pool.could_fit(&gpu_spec(1, 1_000, 2, 12_000))); // only one GPU has 12 GB
+        assert!(!pool.could_fit(&cpu_spec(8, 1_000)));
     }
 }
