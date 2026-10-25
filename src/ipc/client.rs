@@ -4,13 +4,18 @@ use tokio::net::UnixStream;
 use crate::ipc::protocol::{Request, Response};
 use crate::paths::socket_path;
 
-/// Send one request to the daemon and return the response
-/// Connection is closed on drop after response is read
+/// Send one request to the local daemon and return the response
 pub async fn send(request: Request) -> anyhow::Result<Response> {
-    let socket = UnixStream::connect(socket_path()).await?;
+    let stream = UnixStream::connect(socket_path()).await?;
+    exchange(stream, request).await
+}
 
-    // tokio::io::split(socket) consumes the socket with no lifetime tied
-    let (read_half, write_half) = tokio::io::split(socket);
+/// Write one request on a connected stream and read one response
+/// callers that connect themselves can tell a failed connect (nothing sent) from a lost reply
+/// Connection is closed on drop after response is read
+pub async fn exchange(stream: UnixStream, request: Request) -> anyhow::Result<Response> {
+    // tokio::io::split(stream) consumes the stream with no lifetime tied
+    let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut writer = BufWriter::new(write_half);
 

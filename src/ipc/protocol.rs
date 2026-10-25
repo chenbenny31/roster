@@ -6,7 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::resource::discovery::SystemResources;
+use crate::resource::pool::Allocation;
 use crate::workflow::model::JobState;
+use crate::workflow::spec::JobSpec;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -17,6 +20,13 @@ pub enum Request {
     Status { run_id: String },
     Logs { run_id: String, job_id: String },
     Cancel { run_id: String },
+    Info, // this machine's daemon, for `roster info`/`stop`/`node add` and the tunnel health check
+
+    // worker operations, sent by a controller through the node's tunnel
+    // an execution is named by (run_id, job_id); one per job for now
+    Launch { run_id: String, job: JobSpec, allocation: Allocation },
+    Poll   { run_id: String, job_id: String },
+    Kill   { run_id: String, job_id: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -29,6 +39,21 @@ pub enum Response {
     LogPath { path: String, status: JobState },
     Cancelled { run_id: String },
     Error { message: String },
+    Info(NodeInfo),
+
+    Launched { host_pid: u32 },
+    Polled   { exit_code: Option<i32> }, // None while running
+    Killed,
+}
+
+/// What a machine's daemon reports about itself, printed by `roster info`
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NodeInfo {
+    pub version:      String, // crate version, controller and node must match
+    pub pid:          u32,    // `roster stop` signals it
+    pub socket:       String, // absolute path of the daemon's socket
+    pub running_jobs: usize,  // as controller or worker; `roster stop` refuses while nonzero
+    pub resources:    SystemResources,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -86,6 +111,28 @@ mod tests {
         let req = Request::Submit { spec_yaml: "name: test\njobs: []".into() };
         let Request::Submit { spec_yaml } = round_trip_request(req) else { panic!() };
         assert_eq!(spec_yaml, "name: test\njobs: []");
+    }
+
+    #[test]
+    fn worker_messages_round_trip() {
+        let launch = Request::Launch {
+            run_id: "r1".into(),
+            job: JobSpec { id: "train".into(), command: "true".into(), ..Default::default() },
+            allocation: Allocation { cpu: 1, memory_mb: 512, gpus: vec![] },
+        };
+        let Request::Launch { job, .. } = round_trip_request(launch) else { panic!() };
+        assert_eq!(job.id, "train");
+
+        let info = Response::Info(NodeInfo {
+            version: "0.1.0".into(),
+            pid: 4242,
+            socket: "/run/roster.socket".into(),
+            running_jobs: 2,
+            resources: SystemResources { cpu_cores: 4, memory_mb: 8_000, gpus: vec![] },
+        });
+        let Response::Info(node) = round_trip_response(info) else { panic!() };
+        assert_eq!(node.running_jobs, 2);
+        assert_eq!(node.resources.cpu_cores, 4);
     }
 
     #[test]

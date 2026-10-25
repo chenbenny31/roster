@@ -8,7 +8,8 @@ use tokio::time::timeout;
 
 use crate::daemon::DaemonState;
 use crate::executor::JobHandle;
-use crate::ipc::protocol::{JobDetail, RunDetail, RunSummary, Request, Response};
+use crate::ipc::protocol::{JobDetail, NodeInfo, RunDetail, RunSummary, Request, Response};
+use crate::paths::socket_path;
 use crate::workflow::dag;
 use crate::workflow::model::{JobState, WorkflowRun};
 use crate::workflow::spec;
@@ -102,6 +103,23 @@ async fn handle_submit(spec_yaml: String, state: Arc<DaemonState>) -> Response {
     Response::Submitted { run_id }
 }
 
+/// This machine's daemon: identity, inventory, and the jobs it runs as controller or worker
+async fn handle_info(state: Arc<DaemonState>) -> Response {
+    let controlled = state.runs.lock().await
+        .values()
+        .flat_map(|run| run.jobs.values())
+        .filter(|job| job.state == JobState::Running)
+        .count();
+
+    Response::Info(NodeInfo {
+        version:      env!("CARGO_PKG_VERSION").into(),
+        pid:          std::process::id(),
+        socket:       socket_path().display().to_string(),
+        running_jobs: controlled + state.worker.running().await,
+        resources:    state.resources.clone(),
+    })
+}
+
 /// Dispatch a parsed request to appropriate handler
 async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
     match request {
@@ -163,6 +181,10 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
                 },
             }
         },
+        Request::Info => handle_info(state).await,
+        Request::Launch { run_id, job, allocation } => state.worker.launch(run_id, job, allocation).await,
+        Request::Poll { run_id, job_id } => state.worker.poll(run_id, job_id).await,
+        Request::Kill { run_id, job_id } => state.worker.kill(run_id, job_id).await,
         Request::Cancel { run_id } => {
             // collect Running jobs's handles under lock
             let handles: Vec<(String, JobHandle)> = {

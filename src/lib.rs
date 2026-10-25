@@ -6,6 +6,7 @@ pub mod paths;
 pub mod resource;
 pub mod scheduler;
 pub mod store;
+pub mod worker;
 pub mod workflow;
 pub mod event;
 pub mod broadcast;
