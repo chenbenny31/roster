@@ -2,6 +2,7 @@ pub mod daemon;
 pub mod error;
 pub mod executor;
 pub mod ipc;
+pub mod node;
 pub mod paths;
 pub mod resource;
 pub mod scheduler;

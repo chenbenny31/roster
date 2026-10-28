@@ -3,13 +3,13 @@ use async_trait::async_trait;
 use crate::workflow::model::JobInstance;
 use crate::resource::pool::Allocation;
 
+pub mod remote;
 pub mod shell;
 
 // Opaque handle to a launched job, return by `launch` and passed back to `poll`/`cancel`
 #[derive(Debug, Clone)]
 pub struct JobHandle {
     pub host_pid: u32,
-    #[allow(dead_code)]
     backend: Backend,
 }
 
@@ -17,6 +17,12 @@ impl JobHandle {
     /// Construct a handle for a plain host process (ShellExecutor)
     pub(crate) fn process(host_pid: u32) -> Self {
         Self { host_pid, backend: Backend::Process }
+    }
+
+    /// Construct a handle for an execution on another node (RemoteExecutor)
+    /// host_pid is the node's pid, 0 when the launch reply was lost
+    pub(crate) fn remote(host_pid: u32, run_id: String, job_id: String) -> Self {
+        Self { host_pid, backend: Backend::Remote { run_id, job_id } }
     }
 }
 
@@ -26,6 +32,7 @@ enum Backend {
     Process,
     #[allow(dead_code)]
     Container(String),
+    Remote { run_id: String, job_id: String }, // the node's name for the execution
 }
 
 /// Result of non-blocking process poll
@@ -49,6 +56,14 @@ pub enum ExecutorError {
 
     #[error("log setup failed: {0}")]
     LogSetupFailed(std::io::Error),
+
+    /// The node did not answer; nothing is known about the job, so its resources stay held
+    #[error("node unreachable: {0}")]
+    Unreachable(String),
+
+    /// The node answered with an error
+    #[error("node error: {0}")]
+    Remote(String),
 }
 
 /// Trait for job executors, MVP implements ShellExecutor
