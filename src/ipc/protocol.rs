@@ -4,6 +4,7 @@
 //! Max message size: 1MB, enforced by server
 //! One request -> one response -> close, except for subscribe
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::resource::discovery::SystemResources;
@@ -21,6 +22,7 @@ pub enum Request {
     Logs { run_id: String, job_id: String },
     Cancel { run_id: String },
     Info, // this machine's daemon, for `roster info`/`stop`/`node add` and the tunnel health check
+    Nodes, // the nodes this daemon places jobs on, for `roster node ls` and `roster info NODE`
 
     // worker operations, sent by a controller through the node's tunnel
     // an execution is named by (run_id, job_id); one per job for now
@@ -40,6 +42,7 @@ pub enum Response {
     Cancelled { run_id: String },
     Error { message: String },
     Info(NodeInfo),
+    Nodes { nodes: Vec<NodeStatus> },
 
     Launched { host_pid: u32 },
     Polled   { exit_code: Option<i32> }, // None while running
@@ -54,6 +57,21 @@ pub struct NodeInfo {
     pub socket:       String, // absolute path of the daemon's socket
     pub running_jobs: usize,  // as controller or worker; `roster stop` refuses while nonzero
     pub resources:    SystemResources,
+}
+
+/// One node as this daemon sees it, printed by `roster node ls` and `roster info NODE`
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NodeStatus {
+    pub name:           String,
+    pub ssh:            Option<String>, // None = this machine
+    pub online:         bool,
+    pub state:          String,         // node::NodeState as text, e.g. "ssh tunnel down: ..."
+    pub since:          DateTime<Utc>,  // when the node entered that state
+    pub running_jobs:   usize,          // jobs placed there; held while the node is offline
+    pub total:          SystemResources,
+    pub free_cpu:       u32,
+    pub free_memory_mb: u64,
+    pub free_vram_mb:   Vec<u64>,       // per GPU, same order as total.gpus
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]

@@ -29,7 +29,7 @@ roster start                                # on every machine; also stop, resta
 roster enable                               # start at boot and keep running after logout
 roster info [NODE]                          # this machine, or a node as the controller sees it
 roster node add SSH_ALIAS                   # on the controller
-roster nodes
+roster node ls                              # also node rm
 roster node drain NODE_ID
 ```
 
@@ -180,6 +180,8 @@ The current prototype uses its own commands:
 ```bash
 cargo build --locked                 # add --features nvml for NVIDIA discovery
 roster start                         # also stop, restart, info
+roster node add SSH_ALIAS            # on the controller, then roster restart; also node ls, node rm
+roster info NODE                     # state, running jobs, free resources
 roster submit examples/cpu-only.yaml
 roster ps
 roster status <run-id>

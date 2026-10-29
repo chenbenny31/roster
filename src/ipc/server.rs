@@ -8,7 +8,7 @@ use tokio::time::timeout;
 
 use crate::daemon::DaemonState;
 use crate::executor::JobHandle;
-use crate::ipc::protocol::{JobDetail, NodeInfo, RunDetail, RunSummary, Request, Response};
+use crate::ipc::protocol::{JobDetail, NodeInfo, NodeStatus, RunDetail, RunSummary, Request, Response};
 use crate::paths::socket_path;
 use crate::workflow::dag;
 use crate::workflow::model::{JobState, WorkflowRun};
@@ -73,16 +73,13 @@ async fn handle_submit(spec_yaml: String, state: Arc<DaemonState>) -> Response {
         return Response::Error { message: format!("dag validate error: {}", error) };
     }
 
-    // Fail fast if any job requires GPUs but none are available
+    // Fail fast if a job could never fit on any node, it would otherwise wait forever
     {
-        let pool = state.pool.lock().await;
+        let pools = state.pools.lock().await;
         for job in &spec.jobs {
-            if job.resources.gpu > 0 && pool.total.gpus.is_empty() {
+            if !pools.iter().any(|pool| pool.could_fit(&job.resources)) {
                 return Response::Error {
-                    message: format!(
-                        "job '{}' requires {} GPU(s) but this node has none",
-                        job.id, job.resources.gpu
-                    ),
+                    message: format!("job '{}' does not fit on any node: {:?}", job.id, job.resources),
                 };
             }
         }
@@ -118,6 +115,38 @@ async fn handle_info(state: Arc<DaemonState>) -> Response {
         running_jobs: controlled + state.worker.running().await,
         resources:    state.resources.clone(),
     })
+}
+
+/// The nodes this daemon places jobs on: each tunnel's last health check, the jobs placed there, free resources
+async fn handle_nodes(state: Arc<DaemonState>) -> Response {
+    let mut health = Vec::new();
+    for node in &state.nodes {
+        health.push(node.health().await);
+    }
+    let runs = state.runs.lock().await;
+    let pools = state.pools.lock().await;
+
+    let nodes = state.nodes.iter().zip(health).enumerate().map(|(index, (node, health))| {
+        let running_jobs = runs.values()
+            .flat_map(|run| run.jobs.values())
+            .filter(|job| job.state == JobState::Running)
+            .filter(|job| job.executions.iter().any(|execution| execution.node == index))
+            .count();
+        let pool = &pools[index];
+        NodeStatus {
+            name:           node.name.clone(),
+            ssh:            node.ssh.clone(),
+            online:         health.state.is_online(),
+            state:          health.state.to_string(),
+            since:          health.since,
+            running_jobs,
+            total:          pool.total.clone(),
+            free_cpu:       pool.available_cpu,
+            free_memory_mb: pool.available_memory_mb,
+            free_vram_mb:   pool.available_vram_mb.clone(),
+        }
+    }).collect();
+    Response::Nodes { nodes }
 }
 
 /// Dispatch a parsed request to appropriate handler
@@ -182,30 +211,33 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
             }
         },
         Request::Info => handle_info(state).await,
+        Request::Nodes => handle_nodes(state).await,
         Request::Launch { run_id, job, allocation } => state.worker.launch(run_id, job, allocation).await,
         Request::Poll { run_id, job_id } => state.worker.poll(run_id, job_id).await,
         Request::Kill { run_id, job_id } => state.worker.kill(run_id, job_id).await,
         Request::Cancel { run_id } => {
-            // collect Running jobs's handles under lock
-            let handles: Vec<(String, JobHandle)> = {
+            // collect Running jobs' (node, handle) pairs under lock
+            let handles: Vec<(usize, JobHandle)> = {
                 let mut runs = state.runs.lock().await;
                 match runs.get_mut(&run_id) {
                     None => return Response::Error { message: format!("run '{}' not found or not active", run_id) },
                     Some(run) => {
                         run.jobs.values_mut()
                             .filter(|job| matches!(job.state, JobState::Running))
-                            .filter_map(|job| {
+                            .flat_map(|job| {
                                 job.cancelling = true;
-                                job.handle.clone().map(|handle| (job.job_id.clone(), handle))
+                                job.executions.iter()
+                                    .filter_map(|execution| execution.handle.clone().map(|handle| (execution.node, handle)))
+                                    .collect::<Vec<_>>()
                             })
                             .collect()
                     }
                 }
             };
 
-            // cancel each running job outside the lock
-            for (_job_id, handle) in handles {
-                let _ = state.executor.cancel(&handle).await;
+            // cancel each running execution outside the lock, through its node's executor
+            for (node, handle) in handles {
+                let _ = state.nodes[node].executor.cancel(&handle).await;
             }
 
             Response::Cancelled { run_id }

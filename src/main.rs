@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{bail, Context};
+use chrono::Local;
 use clap::{Parser, Subcommand};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -12,13 +13,13 @@ use tokio::time::{sleep, Duration, Instant};
 use tracing_subscriber::EnvFilter;
 
 use roster::ipc::client;
-use roster::ipc::protocol::{NodeInfo, Request, Response};
-use roster::paths::{daemon_log_path, socket_path};
+use roster::ipc::protocol::{NodeInfo, NodeStatus, Request, Response};
+use roster::node;
+use roster::paths::{daemon_log_path, nodes_path, socket_path};
 use roster::resource::discovery::{self, SystemResources};
-use roster::resource::pool::ResourcePool;
 
 #[derive(Parser)]
-#[command(name = "roster", about = "GPU-aware single-node workflow scheduler")]
+#[command(name = "roster", about = "GPU-aware workflow scheduler")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -45,10 +46,17 @@ enum Command {
         #[arg(long, help = "restart anyway; running jobs keep running untracked")]
         force: bool,
     },
-    /// Show this machine's daemon: version, pid, running jobs, inventory
+    /// Show this machine's daemon, or one of its nodes: state, running jobs, free resources
     Info {
-        #[arg(long, help = "print JSON, as read by `node add`")]
+        #[arg(help = "node name, see `roster node ls`")]
+        node: Option<String>,
+        #[arg(long, help = "print JSON; for this machine, as read by `node add`")]
         json: bool,
+    },
+    /// Manage the nodes this daemon places jobs on
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
     },
     /// Submit a workflow YAML
     Submit {
@@ -74,6 +82,24 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum NodeCommand {
+    /// Start roster on a machine you reach over ssh and add it; takes effect on `roster restart`
+    Add {
+        #[arg(help = "ssh destination, e.g. user@host or a ~/.ssh/config alias")]
+        target: String,
+        #[arg(long, help = "node name, defaults to the ssh destination")]
+        name: Option<String>,
+    },
+    /// List nodes in first-fit order with their state
+    Ls,
+    /// Remove a node; takes effect on `roster restart`
+    Rm {
+        #[arg(help = "node name")]
+        name: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -85,9 +111,13 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Start { resources, foreground: true } => {
+            // before opening tunnels, which would take over a running daemon's tunnel sockets
+            if let Some(info) = daemon_info().await? {
+                bail!("a daemon is already running here (pid {})", info.pid);
+            }
             let resources = load_resources(resources)?;
-            let pool = ResourcePool::new(resources.clone());
-            roster::daemon::run(resources, pool).await?;
+            let (nodes, pools) = node::connect(node::load(&nodes_path())?, &resources).await?;
+            roster::daemon::run(resources, nodes, pools).await?;
         },
         Command::Start { resources, foreground: false } => start(resources).await?,
         Command::Stop { force } => stop(force).await?,
@@ -95,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
             stop(force).await?;
             start(resources).await?;
         },
-        Command::Info { json } => {
+        Command::Info { node: None, json } => {
             let info = daemon_info().await?
                 .context("no daemon is running here, start it with `roster start`")?;
             if json {
@@ -103,6 +133,25 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 print_info(&info);
             }
+        },
+        Command::Info { node: Some(name), json } => {
+            let status = node_statuses().await?.into_iter().find(|status| status.name == name)
+                .with_context(|| format!("no node '{}' in this daemon, see `roster node ls`", name))?;
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                print_node(&status);
+            }
+        },
+        Command::Node { command: NodeCommand::Add { target, name } } => {
+            let info = node::add(&nodes_path(), &target, name).await?;
+            println!("added {}: {} cores, {} MB, {} GPUs; run `roster restart` to use it",
+                     target, info.resources.cpu_cores, info.resources.memory_mb, info.resources.gpus.len());
+        },
+        Command::Node { command: NodeCommand::Ls } => list_nodes().await?,
+        Command::Node { command: NodeCommand::Rm { name } } => {
+            node::remove(&nodes_path(), &name)?;
+            println!("removed {}; run `roster restart` to apply", name);
         },
         Command::Submit { file } => {
             let spec_yaml = tokio::fs::read_to_string(&file).await
@@ -199,7 +248,8 @@ async fn start(resources: Option<PathBuf>) -> anyhow::Result<()> {
     }
     let mut child = command.spawn().context("failed to start the daemon")?;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // a controller first opens a tunnel to each node, up to 10 s each
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(info) = daemon_info().await? {
             println!("started (pid {}), log {}", info.pid, log_path.display());
@@ -209,7 +259,7 @@ async fn start(resources: Option<PathBuf>) -> anyhow::Result<()> {
             bail!("daemon exited ({}), see {}", status, log_path.display());
         }
         if Instant::now() >= deadline {
-            bail!("daemon did not answer within 10 s, see {}", log_path.display());
+            bail!("daemon did not answer within 60 s, see {}", log_path.display());
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -252,5 +302,46 @@ fn print_info(info: &NodeInfo) {
     }
     for gpu in &info.resources.gpus {
         println!("gpu {:<3} {}, {} MB", gpu.index, gpu.name, gpu.vram_mb);
+    }
+}
+
+/// Ask this machine's daemon for the nodes it places jobs on
+async fn node_statuses() -> anyhow::Result<Vec<NodeStatus>> {
+    let response = client::send(Request::Nodes).await
+        .context("no daemon is running here, start it with `roster start`")?;
+    match response {
+        Response::Nodes { nodes } => Ok(nodes),
+        other => bail!("unexpected reply: {:?}", other),
+    }
+}
+
+/// The daemon's nodes with their state; without a daemon, what nodes.yaml lists
+async fn list_nodes() -> anyhow::Result<()> {
+    if daemon_info().await?.is_none() {
+        for config in node::load(&nodes_path())? {
+            println!("{:<12} {:<20} daemon not running", config.name, config.ssh.as_deref().unwrap_or("-"));
+        }
+        return Ok(());
+    }
+    println!("{:<12} {:<20} {:<8} {:<12} {}", "NAME", "SSH", "RUNNING", "SINCE", "STATE");
+    for status in node_statuses().await? {
+        println!("{:<12} {:<20} {:<8} {:<12} {}", status.name, status.ssh.as_deref().unwrap_or("-"),
+                 status.running_jobs, status.since.with_timezone(&Local).format("%m-%d %H:%M"), status.state);
+    }
+    Ok(())
+}
+
+fn print_node(status: &NodeStatus) {
+    println!("node    {} ({})", status.name, status.ssh.as_deref().unwrap_or("this machine"));
+    println!("state   {}, since {}", status.state, status.since.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S"));
+    let held = if status.online || status.running_jobs == 0 { "" } else { ", held until the node answers" };
+    println!("jobs    {} running{}", status.running_jobs, held);
+    println!("cpu     {}/{} cores free", status.free_cpu, status.total.cpu_cores);
+    println!("memory  {}/{} MB free", status.free_memory_mb, status.total.memory_mb);
+    if status.total.gpus.is_empty() {
+        println!("gpu     none");
+    }
+    for (gpu, free) in status.total.gpus.iter().zip(&status.free_vram_mb) {
+        println!("gpu {:<3} {}, {}/{} MB free", gpu.index, gpu.name, free, gpu.vram_mb);
     }
 }

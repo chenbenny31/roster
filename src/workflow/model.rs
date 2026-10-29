@@ -188,6 +188,15 @@ pub fn derive_run_state(states: impl Iterator<Item = JobState>) -> RunState {
     RunState::Pending
 }
 
+/// One node's part of a job: where it runs, what it holds, and its process while running
+/// a job has one execution for now; coordinated multi-node jobs will hold several
+#[derive(Debug, Clone)]
+pub struct Execution {
+    pub node:       usize,             // index into DaemonState.nodes
+    pub allocation: Allocation,        // reserved on that node's pool
+    pub handle:     Option<JobHandle>, // set at launch, cleared on exit
+}
+
 /// Runtime state of a single job within a workflow run
 #[derive(Debug, Clone)]
 pub struct JobInstance {
@@ -195,8 +204,7 @@ pub struct JobInstance {
     pub job_seq:    u64, // assigned at submit, used in JobEvent (Copy payload)
     pub spec:       JobSpec,
     pub state:      JobState,
-    pub handle:     Option<JobHandle>, // set when Running, cleared on termin
-    pub allocation: Option<Allocation>,
+    pub executions: Vec<Execution>, // set when Running, taken on release
     pub cancelling: bool, // set before cancel, prevents non-zero exit -> Failed
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at:   Option<DateTime<Utc>>,
@@ -211,8 +219,7 @@ impl JobInstance {
             job_seq,
             spec,
             state:      JobState::Pending,
-            handle:     None,
-            allocation: None,
+            executions: Vec::new(),
             cancelling: false,
             started_at: None,
             ended_at:   None,

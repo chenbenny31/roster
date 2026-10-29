@@ -14,9 +14,8 @@ use tokio::time::{timeout, Duration};
 use crate::broadcast::{self as spmc, SpmcSubscriber};
 use crate::error::RosterError;
 use crate::event::JobEvent;
-use crate::executor::shell::ShellExecutor;
-use crate::executor::Executor;
 use crate::ipc::server::handle_connection;
+use crate::node::Node;
 use crate::paths::db_path;
 use crate::paths::{pid_path, socket_path};
 use crate::resource::discovery::SystemResources;
@@ -29,10 +28,10 @@ use crate::workflow::model::WorkflowRun;
 /// Shared daemon state, accessed behind Arch<DaemonState>
 pub struct DaemonState {
     pub runs:        Mutex<HashMap<String, WorkflowRun>>, // run_id: WorkflowRun
-    pub pool:        Mutex<ResourcePool>,
-    pub executor:    Arc<dyn Executor>, // not a concrete ShellExecutor
-    pub resources:   SystemResources,   // this machine's inventory, reported by Info
-    pub worker:      Worker,            // runs jobs for controllers that use this machine as a node
+    pub nodes:       Vec<Node>,                // nodes.yaml order = first-fit order
+    pub pools:       Mutex<Vec<ResourcePool>>, // same index as nodes
+    pub resources:   SystemResources,          // this machine's inventory, reported by Info
+    pub worker:      Worker,                   // runs jobs for controllers that use this machine as a node
     pub store:       RunStore,
     pub events:      SpmcSubscriber<JobEvent>, // Sync, Clone - IPC handlers call .subscribe()
     pub run_counter: AtomicU64, // fetch_add(1, Relaxed) at submit -> run_seq
@@ -42,13 +41,13 @@ pub struct DaemonState {
 impl DaemonState {
     /// Returns the shared state plus the SpmcSender (must be moved into)
     /// SpmcSender is !Sync - cannot live in Arc<DaemonState>
-    pub fn new(resources: SystemResources, pool: ResourcePool, store: RunStore)
+    pub fn new(resources: SystemResources, nodes: Vec<Node>, pools: Vec<ResourcePool>, store: RunStore)
             -> (Arc<Self>, crate::broadcast::SpmcSender<JobEvent>) {
         let (sender, events) = spmc::channel(256);
         let state = Arc::new(Self {
             runs:        Mutex::new(HashMap::new()),
-            pool:        Mutex::new(pool),
-            executor:    Arc::new(ShellExecutor),
+            nodes,
+            pools:       Mutex::new(pools),
             resources,
             worker:      Worker::default(),
             store,
@@ -62,8 +61,8 @@ impl DaemonState {
 
 /// Entry point for `roster start --foreground`
 /// enforce single instance, write PID file, bind socket, run until signal
-/// `resources` is this machine's inventory, reported to controllers that use it as a node
-pub async fn run(resources: SystemResources, pool: ResourcePool) -> anyhow::Result<()> {
+/// `resources` is this machine's inventory, `nodes` and `pools` what the scheduler places on
+pub async fn run(resources: SystemResources, nodes: Vec<Node>, pools: Vec<ResourcePool>) -> anyhow::Result<()> {
     check_not_running()?;
     write_pid_file()?;
     cleanup_stale_socket();
@@ -71,7 +70,7 @@ pub async fn run(resources: SystemResources, pool: ResourcePool) -> anyhow::Resu
     let store = RunStore::open(&db_path()).await?;
     tracing::info!(path = %db_path().display(), "databased opened");
     store.reconcile_interrupted().await?;
-    let (state, event_sender) = DaemonState::new(resources, pool, store);
+    let (state, event_sender) = DaemonState::new(resources, nodes, pools, store);
 
     let result = tokio::select! {
         r = listen(state.clone()) => r,

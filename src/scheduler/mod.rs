@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -6,12 +7,29 @@ use tokio::time::{interval, Duration};
 use crate::broadcast::SpmcSender;
 use crate::daemon::DaemonState;
 use crate::event::{monotonic_raw_ns, JobEvent};
-use crate::executor::{JobHandle, PollResult};
-use crate::paths::job_log_path;
-use crate::resource::pool::Allocation;
-use crate::workflow::model::{JobInstance, JobState};
+use crate::executor::{ExecutorError, JobHandle, PollResult};
+use crate::node::Node;
+use crate::paths::{job_log_path, job_log_relpath};
+use crate::resource::placement::place;
+use crate::resource::pool::{Allocation, ResourcePool};
+use crate::workflow::model::{Execution, JobInstance, JobState};
 
 const TICK_MS: u64 = 100;
+
+/// Return each execution's allocation to its own node's pool
+fn release(pools: &mut [ResourcePool], executions: &[Execution]) {
+    for execution in executions {
+        pools[execution.node].release(&execution.allocation);
+    }
+}
+
+/// Where a job's log lives: a local path, or `ssh-target:path-under-home` on a remote node
+fn log_path(node: &Node, run_id: &str, job_id: &str) -> PathBuf {
+    match &node.ssh {
+        None => job_log_path(run_id, job_id),
+        Some(target) => PathBuf::from(format!("{}:{}", target, job_log_relpath(run_id, job_id).display())),
+    }
+}
 
 /// Run the scheduler loop alongside the IPC listener, return only process exits
 /// owns the SpmcSender - the single writer to the event ring buffer
@@ -132,25 +150,27 @@ async fn advance_queued(state: &Arc<DaemonState>, event_sender: &SpmcSender<JobE
     struct AdmitTask {
         run_id:  String,
         job_instance: JobInstance,
-        alloc:   Allocation,
+        placement: Vec<(usize, Allocation)>, // (node index, allocation) per member
     }
 
     let mut tasks: Vec<AdmitTask> = Vec::new();
 
     {
         let runs = state.runs.lock().await;
-        let mut pool = state.pool.lock().await;
+        let mut pools = state.pools.lock().await;
+        let online: Vec<bool> = state.nodes.iter().map(|node| node.is_online()).collect();
 
         for run in runs.values() {
             for job in run.jobs.values() {
                 if !matches!(job.state, JobState::Queued) {
                     continue;
                 }
-                if let Some(alloc) = pool.try_reserve(&job.spec.resources) {
+                // one member per job until coordinated jobs add a member count
+                if let Some(placement) = place(&mut pools, &online, std::slice::from_ref(&job.spec.resources)) {
                     tasks.push(AdmitTask {
                         run_id: run.run_id.clone(),
                         job_instance: job.clone(),
-                        alloc,
+                        placement,
                     });
                 }
             }
@@ -161,18 +181,27 @@ async fn advance_queued(state: &Arc<DaemonState>, event_sender: &SpmcSender<JobE
     struct LaunchOutcome {
         run_id: String,
         job_id: String,
-        alloc:  Allocation,
-        result: Result<JobHandle, crate::executor::ExecutorError>,
+        executions: Vec<Execution>,
+        result: Result<(), crate::executor::ExecutorError>,
     }
 
     let mut outcomes: Vec<LaunchOutcome> = Vec::new();
 
     for task in tasks {
-        let result = state.executor.launch(&task.run_id, &task.job_instance, &task.alloc).await;
+        let mut executions = Vec::new();
+        let mut result = Ok(());
+        for (node, allocation) in task.placement {
+            let launched = state.nodes[node].executor.launch(&task.run_id, &task.job_instance, &allocation).await;
+            let handle = match launched {
+                Ok(handle) => Some(handle),
+                Err(error) => { result = Err(error); None }
+            };
+            executions.push(Execution { node, allocation, handle });
+        }
         outcomes.push(LaunchOutcome {
             run_id: task.run_id,
             job_id: task.job_instance.job_id,
-            alloc:  task.alloc,
+            executions,
             result,
         });
     }
@@ -182,31 +211,38 @@ async fn advance_queued(state: &Arc<DaemonState>, event_sender: &SpmcSender<JobE
     // phase 3: apply results under lock
     {
         let mut runs = state.runs.lock().await;
-        let mut pool = state.pool.lock().await;
+        let mut pools = state.pools.lock().await;
 
         for outcome in outcomes {
             let run = match runs.get_mut(&outcome.run_id) {
                 Some(run) => run,
-                None      => { pool.release(&outcome.alloc); continue; }
+                None      => { release(&mut pools, &outcome.executions); continue; }
             };
             let job = match run.jobs.get_mut(&outcome.job_id) {
                 Some(job) => job,
-                None      => { pool.release(&outcome.alloc); continue; }
+                None      => { release(&mut pools, &outcome.executions); continue; }
             };
 
             match outcome.result {
-                Ok(handle) => {
+                Ok(()) => {
+                    // one execution per job for now, its node keeps the log
+                    let log = log_path(&state.nodes[outcome.executions[0].node], &outcome.run_id, &outcome.job_id);
                     job.state       = JobState::Running;
-                    job.handle      = Some(handle);
-                    job.allocation  = Some(outcome.alloc);
+                    job.executions  = outcome.executions;
                     job.started_at  = Some(Utc::now());
-                    job.log_path    = Some(job_log_path(&outcome.run_id, &outcome.job_id));
+                    job.log_path    = Some(log);
                     tracing::info!(run_id = %outcome.run_id, job_id = %outcome.job_id, "job -> Running");
                     to_write.push((outcome.run_id, outcome.job_id));
                 }
+                // the request never left, so the job can wait for another node
+                Err(ExecutorError::Unreachable(reason)) => {
+                    tracing::debug!(run_id = %outcome.run_id, job_id = %outcome.job_id, %reason, "node unreachable, job stays Queued");
+                    release(&mut pools, &outcome.executions);
+                }
                 Err(error) => {
                     tracing::error!(run_id = %outcome.run_id, job_id = %outcome.job_id, %error, "launch failed -> Failed");
-                    pool.release(&outcome.alloc);
+                    // with several members, the ones already launched must be stopped first
+                    release(&mut pools, &outcome.executions);
                     job.state    = JobState::Failed;
                     job.ended_at = Some(Utc::now());
                     to_write.push((outcome.run_id, outcome.job_id));
@@ -224,6 +260,7 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
     struct RunningJob {
         run_id:     String,
         job_id:     String,
+        node:       usize,
         handle:     JobHandle,
         cancelling: bool,
     }
@@ -234,12 +271,18 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
             .flat_map(|run| {
                 run.jobs.values()
                     .filter(|job| matches!(job.state, JobState::Running))
-                    .filter_map(|job| job.handle.clone().map(|handle| RunningJob {
-                        run_id:     run.run_id.clone(),
-                        job_id:     job.job_id.clone(),
-                        handle,
-                        cancelling: job.cancelling,
-                    }))
+                    .filter_map(|job| {
+                        // one execution per job for now; polling several and combining
+                        // their outcomes comes with coordinated jobs
+                        let execution = job.executions.first()?;
+                        execution.handle.clone().map(|handle| RunningJob {
+                            run_id:     run.run_id.clone(),
+                            job_id:     job.job_id.clone(),
+                            node:       execution.node,
+                            handle,
+                            cancelling: job.cancelling,
+                        })
+                    })
                     .collect::<Vec<_>>()
             })
             .collect()
@@ -256,7 +299,7 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
     let mut entries: Vec<PollEntry> = Vec::new();
 
     for job in running {
-        let result = state.executor.poll(&job.handle).await;
+        let result = state.nodes[job.node].executor.poll(&job.handle).await;
         entries.push(PollEntry {
             run_id:     job.run_id,
             job_id:     job.job_id,
@@ -270,7 +313,7 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
     // phase 3: apply result under lock
     {
         let mut runs = state.runs.lock().await;
-        let mut pool = state.pool.lock().await;
+        let mut pools = state.pools.lock().await;
 
         for entry in entries {
             let run = match runs.get_mut(&entry.run_id) {
@@ -283,21 +326,21 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
             };
 
             match entry.result {
+                // nothing is known, so the job stays Running and keeps its resources until the node answers
+                Err(ExecutorError::Unreachable(_)) => {}
                 Err(error) => {
                     tracing::error!(run_id = %entry.run_id, job_id = %entry.job_id, %error, "poll failed -> Failed");
-                    if let Some(alloc) = job.allocation.take() { pool.release(&alloc); }
+                    release(&mut pools, &std::mem::take(&mut job.executions));
                     job.state    = JobState::Failed;
                     job.ended_at = Some(Utc::now());
-                    job.handle   =  None;
                     to_write.push((entry.run_id, entry.job_id));
                 }
                 Ok(PollResult::Running) => {} // no change
                 Ok(PollResult::Exited { exit_code }) => {
-                    if let Some(alloc) = job.allocation.take() { pool.release(&alloc); }
+                    release(&mut pools, &std::mem::take(&mut job.executions));
 
                     job.exit_code = Some(exit_code);
                     job.ended_at  = Some(Utc::now());
-                    job.handle    = None;
 
                     // cancelling flag prevents non-zero exit, failed when kill the job
                     job.state = if entry.cancelling {
