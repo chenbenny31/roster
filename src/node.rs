@@ -144,7 +144,7 @@ pub fn save(path: &Path, configs: &[NodeConfig]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `roster node add`: start the node's daemon and read its info over ssh, then append it to nodes.yaml
+/// `roster node add`: enable the node's daemon and read its info over ssh, then append it to nodes.yaml
 /// the controller daemon picks it up on restart
 pub async fn add(path: &Path, target: &str, name: Option<String>) -> anyhow::Result<NodeInfo> {
     let mut configs = load(path)?;
@@ -179,10 +179,10 @@ pub fn remove(path: &Path, name: &str) -> anyhow::Result<()> {
     save(path, &configs)
 }
 
-/// Start the node's daemon (a no-op if it runs) and read its info; needs roster on the node's PATH
-/// one ssh session; start's own output is dropped so stdout carries only the JSON
+/// Enable the node's daemon (a no-op if already enabled) and read its info; needs roster on the node's PATH
+/// one ssh session; enable's own output is dropped so stdout carries only the JSON
 async fn info_over_ssh(target: &str) -> anyhow::Result<NodeInfo> {
-    let remote = "roster start > /dev/null && roster info --json";
+    let remote = "roster enable > /dev/null && roster info --json";
     let output = Command::new("ssh")
         .args(["-o", "LogLevel=ERROR", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target, remote])
         .stdin(Stdio::null())

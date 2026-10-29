@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 use roster::ipc::client;
 use roster::ipc::protocol::{NodeInfo, NodeStatus, Request, Response};
 use roster::node;
-use roster::paths::{daemon_log_path, nodes_path, socket_path};
+use roster::paths::{daemon_log_path, nodes_path, socket_path, unit_path};
 use roster::resource::discovery::{self, SystemResources};
 
 #[derive(Parser)]
@@ -44,6 +44,16 @@ enum Command {
         #[arg(long, help = "declared inventory (YAML or JSON) instead of discovering this machine's")]
         resources: Option<PathBuf>,
         #[arg(long, help = "restart anyway; running jobs keep running untracked")]
+        force: bool,
+    },
+    /// Run this machine's daemon under systemd: now, at boot, and after logout
+    Enable {
+        #[arg(long, help = "declared inventory (YAML or JSON) instead of discovering this machine's")]
+        resources: Option<PathBuf>,
+    },
+    /// Undo `enable`: stop the daemon and remove its systemd unit; refuses while jobs are running
+    Disable {
+        #[arg(long, help = "disable anyway; running jobs keep running untracked")]
         force: bool,
     },
     /// Show this machine's daemon, or one of its nodes: state, running jobs, free resources
@@ -120,6 +130,8 @@ async fn main() -> anyhow::Result<()> {
             roster::daemon::run(resources, nodes, pools).await?;
         },
         Command::Start { resources, foreground: false } => start(resources).await?,
+        Command::Enable { resources } => enable(resources).await?,
+        Command::Disable { force } => disable(force).await?,
         Command::Stop { force } => stop(force).await?,
         Command::Restart { resources, force } => {
             stop(force).await?;
@@ -213,9 +225,19 @@ async fn daemon_info() -> anyhow::Result<Option<NodeInfo>> {
 
 /// Run this binary again as `start --foreground` in a new session, logging to daemon.log,
 /// and return once it answers; a daemon already running counts as started
+/// once enabled, systemd starts it instead
 async fn start(resources: Option<PathBuf>) -> anyhow::Result<()> {
     if let Some(info) = daemon_info().await? {
         println!("already running (pid {})", info.pid);
+        return Ok(());
+    }
+    if unit_path().exists() {
+        if resources.is_some() {
+            bail!("the daemon runs under systemd; change its inventory with `roster enable --resources FILE`");
+        }
+        run("systemctl", &["--user", "start", "roster"])?;
+        let info = wait_for_daemon(None, JOURNAL).await?;
+        println!("started (pid {}), log `{}`", info.pid, JOURNAL);
         return Ok(());
     }
 
@@ -246,23 +268,101 @@ async fn start(resources: Option<PathBuf>) -> anyhow::Result<()> {
             Ok(())
         });
     }
-    let mut child = command.spawn().context("failed to start the daemon")?;
+    let child = command.spawn().context("failed to start the daemon")?;
 
+    let log = log_path.display().to_string();
+    let info = wait_for_daemon(Some(child), &log).await?;
+    println!("started (pid {}), log {}", info.pid, log);
+    Ok(())
+}
+
+/// Where a daemon run by systemd logs
+const JOURNAL: &str = "journalctl --user -u roster";
+
+/// Wait until the daemon answers; `child` is the process `start` spawned, to notice it exit early
+async fn wait_for_daemon(mut child: Option<std::process::Child>, log: &str) -> anyhow::Result<NodeInfo> {
     // a controller first opens a tunnel to each node, up to 10 s each
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(info) = daemon_info().await? {
-            println!("started (pid {}), log {}", info.pid, log_path.display());
-            return Ok(());
+            return Ok(info);
         }
-        if let Some(status) = child.try_wait()? {
-            bail!("daemon exited ({}), see {}", status, log_path.display());
+        if let Some(child) = child.as_mut() {
+            if let Some(status) = child.try_wait()? {
+                bail!("daemon exited ({}), see {}", status, log);
+            }
         }
         if Instant::now() >= deadline {
-            bail!("daemon did not answer within 60 s, see {}", log_path.display());
+            bail!("daemon did not answer within 60 s, see {}", log);
         }
         sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Run the daemon as a systemd user service, with linger so it starts at boot and survives logout;
+/// replaces a daemon started by `roster start`; without --resources an existing unit is kept,
+/// so `node add` never changes a node's declared inventory
+async fn enable(resources: Option<PathBuf>) -> anyhow::Result<()> {
+    run("loginctl", &["enable-linger"])
+        .context("run `sudo loginctl enable-linger $USER` once, then `roster enable` again")?;
+
+    let path = unit_path();
+    let enabled = path.exists();
+    if !enabled && daemon_info().await?.is_some() {
+        stop(false).await?; // started by `roster start`; refuses while it runs jobs
+    }
+    if !enabled || resources.is_some() {
+        let unit = unit_file(resources)?;
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(unit.as_str()) {
+            std::fs::create_dir_all(path.parent().expect("unit path has a parent"))?;
+            std::fs::write(&path, unit)?;
+            run("systemctl", &["--user", "daemon-reload"])?;
+            if enabled {
+                println!("unit updated, run `roster restart` to apply");
+            }
+        }
+    }
+    run("systemctl", &["--user", "enable", "--now", "roster"])?;
+
+    let info = wait_for_daemon(None, JOURNAL).await?;
+    println!("enabled, running (pid {}), log `{}`", info.pid, JOURNAL);
+    Ok(())
+}
+
+/// The unit `enable` writes; KillMode=process so stopping the daemon leaves its jobs running, as `roster stop` does
+fn unit_file(resources: Option<PathBuf>) -> anyhow::Result<String> {
+    let mut exec = format!("\"{}\" start --foreground", std::env::current_exe()?.display());
+    if let Some(path) = resources {
+        let path = std::fs::canonicalize(&path).with_context(|| format!("no resources file {}", path.display()))?;
+        exec.push_str(&format!(" --resources \"{}\"", path.display()));
+    }
+    Ok(format!("[Unit]\nDescription=roster daemon\n\n\
+                [Service]\nExecStart={}\nEnvironment=RUST_LOG=info\nKillMode=process\nRestart=on-failure\n\n\
+                [Install]\nWantedBy=default.target\n", exec))
+}
+
+/// Undo `enable`: stop the daemon and remove its unit; linger stays, other user services may need it
+async fn disable(force: bool) -> anyhow::Result<()> {
+    if !unit_path().exists() {
+        println!("not enabled");
+        return Ok(());
+    }
+    stop(force).await?;
+    run("systemctl", &["--user", "disable", "roster"])?;
+    std::fs::remove_file(unit_path())?;
+    run("systemctl", &["--user", "daemon-reload"])?;
+    println!("disabled");
+    Ok(())
+}
+
+/// Run a command to completion, failing with its error output
+fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
+    let output = std::process::Command::new(program).args(args).output()
+        .with_context(|| format!("failed to run {}", program))?;
+    if !output.status.success() {
+        bail!("`{} {}` failed: {}", program, args.join(" "), String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
 }
 
 /// SIGTERM the daemon and wait for it to exit; refuse while it runs jobs unless forced,
@@ -275,6 +375,11 @@ async fn stop(force: bool) -> anyhow::Result<()> {
     if info.running_jobs > 0 && !force {
         bail!("{} jobs are running and would keep running untracked; wait for them or use --force",
               info.running_jobs);
+    }
+    if unit_path().exists() {
+        run("systemctl", &["--user", "stop", "roster"])?; // returns once the daemon has exited
+        println!("stopped (pid {})", info.pid);
+        return Ok(());
     }
 
     let pid = Pid::from_raw(info.pid as i32);

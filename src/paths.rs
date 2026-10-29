@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 /// Returns the runtime dir for roster socket and PID file
-/// $XDG_RUNTIME_DIR falls back to ~/.local/run for non-systemd
+/// $XDG_RUNTIME_DIR (/run/user/UID, kept after logout by `roster enable`'s linger), else ~/.local/run
 pub fn runtime_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XRD_RUNTIME_DIR") {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(dir);
     }
     let home = std::env::var_os("HOME").expect("HOME not set");
@@ -62,6 +62,16 @@ pub fn nodes_path() -> PathBuf {
         .join(".config")
         .join("roster")
         .join("nodes.yaml")
+}
+
+/// systemd user unit written by `roster enable`: ~/.config/systemd/user/roster.service
+pub fn unit_path() -> PathBuf {
+    let home = std::env::var_os("HOME").expect("HOME not set");
+    PathBuf::from(home)
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("roster.service")
 }
 
 /// Local end of the ssh tunnel to a node's daemon socket
