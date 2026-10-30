@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use crate::resource::discovery::SystemResources;
 use crate::resource::health::GpuHealth;
 use crate::resource::pool::Allocation;
-use crate::workflow::model::JobState;
 use crate::workflow::spec::JobSpec;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -32,6 +31,7 @@ pub enum Request {
     Launch { run_id: String, job: JobSpec, allocation: Allocation },
     Poll   { run_id: String, job_id: String },
     Kill   { run_id: String, job_id: String },
+    LogTail { run_id: String, job_id: String, bytes: u64 }, // the end of a job's log, for `roster logs` and failure reasons
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -41,7 +41,7 @@ pub enum Response {
     Submitted { run_id: String },
     PsResult { runs: Vec<RunSummary>},
     StatusResult { run: RunDetail },
-    LogPath { path: String, status: JobState },
+    Log { text: String }, // the end of a job's log, read on the node that ran it
     Cancelled { run_id: String },
     Error { message: String },
     Info(NodeInfo),
@@ -178,16 +178,14 @@ mod tests {
     }
 
     #[test]
-    fn log_path_round_trip() {
-        let home = std::env::var("HOME").unwrap();
-        let path = format!("{}/.local/share/roster/runs/abc/preprocess.log", home);
-        let res = Response::LogPath {
-            path: path.clone(),
-            status: JobState::Running,
-        };
-        let Response::LogPath { path: got, status } = round_trip_response(res) else { panic!() };
-        assert!(got.contains("/preprocess.log"));
-        assert!(matches!(status, JobState::Running));
+    fn log_round_trip() {
+        let request = Request::LogTail { run_id: "abc".into(), job_id: "preprocess".into(), bytes: 4096 };
+        let Request::LogTail { job_id, bytes, .. } = round_trip_request(request) else { panic!() };
+        assert_eq!((job_id.as_str(), bytes), ("preprocess", 4096));
+
+        let res = Response::Log { text: "epoch 1\nloss: nan\n".into() };
+        let Response::Log { text } = round_trip_response(res) else { panic!() };
+        assert_eq!(text, "epoch 1\nloss: nan\n");
     }
 
     #[test]

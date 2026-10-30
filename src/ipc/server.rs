@@ -10,6 +10,7 @@ use crate::daemon::DaemonState;
 use crate::executor::JobHandle;
 use crate::ipc::protocol::{JobDetail, NodeInfo, NodeStatus, RunDetail, RunSummary, Request, Response};
 use crate::paths::socket_path;
+use crate::scheduler::log_path;
 use crate::workflow::dag;
 use crate::workflow::model::{JobState, WorkflowRun};
 use crate::workflow::spec;
@@ -102,6 +103,31 @@ async fn handle_submit(spec_yaml: String, state: Arc<DaemonState>) -> Response {
 }
 
 /// This machine's daemon: identity, inventory, and the jobs it runs as controller or worker
+/// How much of a log `roster logs` prints; training logs can be gigabytes
+const LOG_BYTES: u64 = 1 << 20;
+
+/// A job's log, read by the node that ran it, so nobody needs to log in there
+async fn handle_logs(state: Arc<DaemonState>, run_id: String, job_id: String) -> Response {
+    let job_rows = match state.store.list_jobs(&run_id).await {
+        Err(error) => return Response::Error { message: format!("db error: {}", error) },
+        Ok(rows) => rows,
+    };
+    let Some(job) = job_rows.into_iter().find(|j| j.job_id == job_id) else {
+        return Response::Error { message: format!("job '{}' not found in run '{}'", job_id, run_id) };
+    };
+    let Some(path) = job.log_path else {
+        return Response::Error { message: "log not available yet".into() };
+    };
+    // the stored path names the node: its ssh target and a path under HOME, or a path on this machine
+    let Some(node) = state.nodes.iter().find(|node| log_path(node, &run_id, &job_id).to_string_lossy() == path) else {
+        return Response::Error { message: format!("the node that ran it is no longer in nodes.yaml; its log was {}", path) };
+    };
+    match node.executor.tail(&run_id, &job_id, LOG_BYTES).await {
+        Ok(text) => Response::Log { text },
+        Err(error) => Response::Error { message: format!("can't read the log on {}: {}", node.name, error) },
+    }
+}
+
 async fn handle_info(state: Arc<DaemonState>) -> Response {
     let controlled = state.runs.lock().await
         .values()
@@ -224,23 +250,7 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
                 },
             }
         },
-        Request::Logs { run_id, job_id } => {
-            let job_rows = match state.store.list_jobs(&run_id).await {
-                Err(error) => return Response::Error { message: format!("db error: {}", error) },
-                Ok(rows) => rows,
-            };
-            match job_rows.into_iter().find(|j| j.job_id == job_id) {
-                None => Response::Error { message: format!("run '{}' not found in run '{}'", job_id, run_id) },
-                Some(job) => match job.log_path {
-                    None => Response::Error { message: "log not available yet".into() },
-                    Some(path) => Response::LogPath {
-                        path,
-                        status: serde_json::from_str(&format!("\"{}\"", job.state))
-                            .unwrap_or(crate::workflow::model::JobState::Pending),
-                    },
-                },
-            }
-        },
+        Request::Logs { run_id, job_id } => handle_logs(state, run_id, job_id).await,
         Request::Info => handle_info(state).await,
         Request::Nodes => handle_nodes(state).await,
         Request::ClearGpu { node, gpu } => handle_clear_gpu(state, node, gpu).await,
@@ -254,6 +264,7 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
         Request::Launch { run_id, job, allocation } => state.worker.launch(run_id, job, allocation).await,
         Request::Poll { run_id, job_id } => state.worker.poll(run_id, job_id).await,
         Request::Kill { run_id, job_id } => state.worker.kill(run_id, job_id).await,
+        Request::LogTail { run_id, job_id, bytes } => state.worker.tail(run_id, job_id, bytes).await,
         Request::Cancel { run_id } => {
             // collect Running jobs' (node, handle) pairs under lock
             let handles: Vec<(usize, JobHandle)> = {

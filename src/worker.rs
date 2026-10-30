@@ -82,6 +82,14 @@ impl Worker {
         }
     }
 
+    /// The end of a job's log here, whether or not this daemon started the job
+    pub async fn tail(&self, run_id: String, job_id: String, bytes: u64) -> Response {
+        match ShellExecutor.tail(&run_id, &job_id, bytes).await {
+            Ok(text) => Response::Log { text },
+            Err(error) => Response::Error { message: error.to_string() },
+        }
+    }
+
     /// Processes started here that have not exited, for `roster info` and `roster stop`
     /// a process that can't be checked counts as running
     pub async fn running(&self) -> usize {

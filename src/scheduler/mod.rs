@@ -8,6 +8,7 @@ use tokio::time::{interval, Duration, Instant};
 use crate::broadcast::SpmcSender;
 use crate::daemon::DaemonState;
 use crate::event::{monotonic_raw_ns, JobEvent};
+use crate::executor::shell::CUT_NOTICE;
 use crate::executor::{ExecutorError, JobHandle, PollResult};
 use crate::ipc::protocol::Request;
 use crate::node::Node;
@@ -31,6 +32,10 @@ const QUALIFY_EVERY: chrono::TimeDelta = chrono::TimeDelta::hours(24);
 const QUALIFY_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const QUALIFY_SETTLE: Duration = Duration::from_secs(60);
 
+/// How much of a failed job's log is read for its reason; the last lines usually name the error
+const REASON_TAIL_BYTES: u64 = 4096;
+const REASON_LINES: usize = 3;
+
 /// Return each execution's allocation to its own node's pool
 fn release(pools: &mut [ResourcePool], executions: &[Execution]) {
     for execution in executions {
@@ -38,8 +43,36 @@ fn release(pools: &mut [ResourcePool], executions: &[Execution]) {
     }
 }
 
+/// Why a job ended badly, from the last lines of its log, e.g.
+/// "exit 1: File "train.py", line 1, in <module> | import torch | ModuleNotFoundError: No module named 'torch'"
+fn exit_reason(exit_code: i32, tail: Option<&str>) -> String {
+    let ended = match exit_code {
+        -1   => "killed by a signal".to_string(),
+        code => format!("exit {}", code),
+    };
+    // progress bars redraw with \r, so each redraw counts as a line; Python's ^^^ and ~~~ lines only point
+    // at the line above
+    let lines: Vec<&str> = tail.unwrap_or_default()
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != CUT_NOTICE && !line.chars().all(|c| matches!(c, '^' | '~')))
+        .collect();
+    match lines.len() {
+        0 => ended,
+        n => format!("{}: {}", ended, lines[n.saturating_sub(REASON_LINES)..].join(" | ")),
+    }
+}
+
+/// A job keeps every reason it collected, e.g. the nodes that turned it down and then its exit
+fn add_reason(job: &mut JobInstance, reason: String) {
+    job.reason = Some(match job.reason.take() {
+        Some(earlier) => format!("{}; {}", earlier, reason),
+        None          => reason,
+    });
+}
+
 /// Where a job's log lives: a local path, or `ssh-target:path-under-home` on a remote node
-fn log_path(node: &Node, run_id: &str, job_id: &str) -> PathBuf {
+pub fn log_path(node: &Node, run_id: &str, job_id: &str) -> PathBuf {
     match &node.ssh {
         None => job_log_path(run_id, job_id),
         Some(target) => PathBuf::from(format!("{}:{}", target, job_log_relpath(run_id, job_id).display())),
@@ -432,7 +465,7 @@ async fn advance_queued(state: &Arc<DaemonState>, event_sender: &SpmcSender<JobE
                     release(&mut pools, &outcome.executions);
                     job.state    = JobState::Failed;
                     job.ended_at = Some(Utc::now());
-                    job.reason   = Some(error.to_string());
+                    add_reason(job, error.to_string());
                     to_write.push((outcome.run_id, outcome.job_id));
                 }
             }
@@ -482,17 +515,25 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
         job_id:     String,
         cancelling: bool,
         result:     Result<PollResult, crate::executor::ExecutorError>,
+        tail:       Option<String>, // end of the log of a job that failed on its own
     }
 
     let mut entries: Vec<PollEntry> = Vec::new();
 
     for job in running {
-        let result = state.nodes[job.node].executor.poll(&job.handle).await;
+        let executor = &state.nodes[job.node].executor;
+        let result = executor.poll(&job.handle).await;
+        let tail = match &result {
+            Ok(PollResult::Exited { exit_code }) if *exit_code != 0 && !job.cancelling =>
+                executor.tail(&job.run_id, &job.job_id, REASON_TAIL_BYTES).await.ok(),
+            _ => None,
+        };
         entries.push(PollEntry {
             run_id:     job.run_id,
             job_id:     job.job_id,
             cancelling: job.cancelling,
             result,
+            tail,
         });
     }
 
@@ -521,6 +562,7 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
                     release(&mut pools, &std::mem::take(&mut job.executions));
                     job.state    = JobState::Failed;
                     job.ended_at = Some(Utc::now());
+                    add_reason(job, format!("poll failed: {}", error));
                     to_write.push((entry.run_id, entry.job_id));
                 }
                 Ok(PollResult::Running) => {} // no change
@@ -546,7 +588,9 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
                         tracing::info!(run_id = %entry.run_id, job_id = %entry.job_id, "job -> Succeeded");
                         JobState::Succeeded
                     } else {
-                        tracing::info!(run_id = %entry.run_id, job_id = %entry.job_id, "job -> Failed");
+                        let reason = exit_reason(exit_code, entry.tail.as_deref());
+                        tracing::warn!(run_id = %entry.run_id, job_id = %entry.job_id, %reason, "job -> Failed");
+                        add_reason(job, reason);
                         JobState::Failed
                     };
 
@@ -557,4 +601,24 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
     }
 
     flush_transitions(state, event_sender, &to_write).await;
+}
+
+// tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_job_is_explained_by_the_end_of_its_log() {
+        let traceback = "epoch 0\nTraceback (most recent call last):\n  File \"train.py\", line 1, in <module>\n    import torch\nModuleNotFoundError: No module named 'torch'\n";
+        assert_eq!(exit_reason(1, Some(traceback)),
+                   "exit 1: File \"train.py\", line 1, in <module> | import torch | ModuleNotFoundError: No module named 'torch'");
+        assert_eq!(exit_reason(-1, Some("step 10\r step 11\r")), "killed by a signal: step 10 | step 11");
+        assert_eq!(exit_reason(2, Some("[earlier output cut]\n\n")), "exit 2");
+        let marked = "  File \"<string>\", line 1, in <module>\n    import torch\n    ^^^^^^^^^^^^\nModuleNotFoundError: No module named 'torch'\n";
+        assert_eq!(exit_reason(1, Some(marked)),
+                   "exit 1: File \"<string>\", line 1, in <module> | import torch | ModuleNotFoundError: No module named 'torch'");
+        assert_eq!(exit_reason(137, None), "exit 137");
+    }
 }

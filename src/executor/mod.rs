@@ -76,6 +76,9 @@ pub enum ExecutorError {
     #[error("log setup failed: {0}")]
     LogSetupFailed(std::io::Error),
 
+    #[error("log read failed: {0}")]
+    LogReadFailed(std::io::Error),
+
     /// The node did not answer; nothing is known about the job, so its resources stay held
     #[error("node unreachable: {0}")]
     Unreachable(String),
@@ -101,4 +104,7 @@ pub trait Executor: Send + Sync {
 
     /// Send SIGTERM, wait 5s, send SIGKILL, return when signal is sent
     async fn cancel(&self, handle: &JobHandle) -> Result<(), ExecutorError>;
+
+    /// The last `bytes` of a job's log, read where the job ran; works while it runs and after it ended
+    async fn tail(&self, run_id: &str, job_id: &str, bytes: u64) -> Result<String, ExecutorError>;
 }

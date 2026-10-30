@@ -95,9 +95,9 @@ enum Command {
         #[arg(help = "run id")]
         id: String,
     },
-    /// Tail logs for a job
+    /// Print the end of a job's log (up to 1 MB), read on the node that ran it
     Logs {
-        #[arg(help = "job id")]
+        #[arg(help = "RUN_ID/JOB_ID")]
         id: String,
     },
     /// Cancel a run
@@ -231,7 +231,11 @@ async fn main() -> anyhow::Result<()> {
                     job_id: parts[1].into()
                 }
             ).await?;
-            println!("{:?}", response);
+            match response {
+                // a closed pipe, e.g. `roster logs ... | head`, just ends the output
+                Response::Log { text } => { let _ = std::io::Write::write_all(&mut std::io::stdout(), text.as_bytes()); }
+                other => println!("{:?}", other),
+            }
         },
         Command::Cancel { .. } => { unimplemented!("cancel") },
     }

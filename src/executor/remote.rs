@@ -106,4 +106,15 @@ impl Executor for RemoteExecutor {
             other => Err(ExecutorError::Remote(format!("unexpected reply: {:?}", other))),
         }
     }
+
+    /// The node reads its own copy of the log
+    async fn tail(&self, run_id: &str, job_id: &str, bytes: u64) -> Result<String, ExecutorError> {
+        let stream = self.connect().await?;
+        let request = Request::LogTail { run_id: run_id.into(), job_id: job_id.into(), bytes };
+
+        match self.exchange(stream, request, Duration::from_secs(10)).await? {
+            Response::Log { text } => Ok(text),
+            other => Err(ExecutorError::Remote(format!("unexpected reply: {:?}", other))),
+        }
+    }
 }

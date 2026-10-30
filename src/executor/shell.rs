@@ -74,6 +74,8 @@ impl Executor for ShellExecutor {
             .env("CUDA_VISIBLE_DEVICES", &gpu_indices)
             .env("ROSTER_GPUS", placement.gpus.len().to_string()) // how many cards it got, e.g. for --tensor-parallel-size
             .env("ROSTER_BIN", std::env::current_exe().unwrap_or_default()) // this roster, e.g. for `roster qualify`
+            // Python buffers stdout into a file, so prints would reach the log late and after a crash's traceback
+            .env("PYTHONUNBUFFERED", "1")
             .stdout(log_file)
             .stderr(stderr_file);
 
@@ -124,6 +126,10 @@ impl Executor for ShellExecutor {
         let _ = killpg(pgid, Signal::SIGKILL);
         Ok(())
     }
+
+    async fn tail(&self, run_id: &str, job_id: &str, bytes: u64) -> Result<String, ExecutorError> {
+        read_tail(&job_log_path(run_id, job_id), bytes).map_err(ExecutorError::LogReadFailed)
+    }
 }
 
 impl ShellExecutor {
@@ -141,6 +147,26 @@ impl ShellExecutor {
         }
         Some(JobHandle::process(pid.unwrap_or(0), Some(unit), Some(exit_file)))
     }
+}
+
+/// First line of a log's end when the log is longer than what was asked for
+pub const CUT_NOTICE: &str = "[earlier output cut]";
+
+/// The end of a file, at most `bytes` long; when the file is longer, it starts at the next whole line
+/// after CUT_NOTICE
+fn read_tail(path: &Path, bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    let start = file.metadata()?.len().saturating_sub(bytes);
+    file.seek(SeekFrom::Start(start))?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    let text = String::from_utf8_lossy(&buffer);
+    if start == 0 {
+        return Ok(text.into_owned());
+    }
+    let whole_lines = text.split_once('\n').map_or("", |(_, rest)| rest);
+    Ok(format!("{}\n{}", CUT_NOTICE, whole_lines))
 }
 
 /// Runs the job, then writes its exit code through a temp file, so a reader never sees half of it
@@ -391,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn cuda_visible_devices_set_from_placement() {
         let executor = ShellExecutor;
-        let job = make_job("gpu-echo-job", "echo $CUDA_VISIBLE_DEVICES");
+        let job = make_job("gpu-echo-job", "echo cuda=$CUDA_VISIBLE_DEVICES python=$PYTHONUNBUFFERED");
         let placement = Allocation {
             cpu: 1,
             memory_mb: 512,
@@ -405,7 +431,7 @@ mod tests {
 
         let log_path = job_log_path(&run, "gpu-echo-job");
         let contents = fs::read_to_string(&log_path).unwrap();
-        assert!(contents.contains("1"));
+        assert!(contents.contains("cuda=1 python=1"), "{}", contents);
     }
 
     // the tests below need a systemd user manager; without one they pass trivially
@@ -507,6 +533,18 @@ mod tests {
                         "PATH=/opt/x no-such-program-1f2e", "(no-such-program-1f2e)", "~/bin/train", ""] {
             assert!(check_program(command).is_ok(), "{}", command);
         }
+    }
+
+    #[test]
+    fn a_long_log_is_cut_at_a_line() {
+        let path = std::env::temp_dir().join(format!("roster-tail-{}.log", uuid::Uuid::new_v4()));
+        fs::write(&path, (1..=1000).map(|n| format!("line {}\n", n)).collect::<String>()).unwrap();
+        assert!(read_tail(&path, 1 << 20).unwrap().starts_with("line 1\n"));
+
+        let tail = read_tail(&path, 30).unwrap();
+        assert_eq!(tail, "[earlier output cut]\nline 998\nline 999\nline 1000\n");
+        fs::remove_file(&path).unwrap();
+        assert!(read_tail(&path, 30).is_err());
     }
 
     #[tokio::test]
