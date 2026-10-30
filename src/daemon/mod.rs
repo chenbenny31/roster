@@ -48,12 +48,13 @@ impl DaemonState {
     pub fn new(resources: SystemResources, nodes: Vec<Node>, pools: Vec<ResourcePool>, store: RunStore)
             -> (Arc<Self>, crate::broadcast::SpmcSender<JobEvent>) {
         let (sender, events) = spmc::channel(256);
+        let gpu_monitor = GpuMonitor::open(&resources.gpus);
         let state = Arc::new(Self {
             runs:        Mutex::new(HashMap::new()),
             nodes,
             pools:       Mutex::new(pools),
             resources,
-            gpu_monitor: GpuMonitor::open(),
+            gpu_monitor,
             worker:      Worker::default(),
             store,
             events,

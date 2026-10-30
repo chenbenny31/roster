@@ -40,6 +40,7 @@ pub struct Node {
     pub name:     String,
     pub ssh:      Option<String>,
     pub executor: Arc<dyn Executor>,
+    pub socket:   Option<PathBuf>,    // local end of the tunnel, for requests other than jobs; None for this machine
     online:       Arc<AtomicBool>,    // false while the tunnel or the node daemon is down
     health:       Arc<Mutex<Health>>, // written by the tunnel task
 }
@@ -218,6 +219,7 @@ pub async fn connect(configs: Vec<NodeConfig>, local: &SystemResources)
     for config in configs {
         let online = Arc::new(AtomicBool::new(true));
         let health = Arc::new(Mutex::new(Health { state: NodeState::Online, since: Utc::now(), info: None }));
+        let mut socket = None;
 
         let (executor, resources): (Arc<dyn Executor>, SystemResources) = match (&config.ssh, &config.socket) {
             (None, _) => (Arc::new(ShellExecutor), local.clone()),
@@ -232,6 +234,7 @@ pub async fn connect(configs: Vec<NodeConfig>, local: &SystemResources)
                     .with_context(|| format!("node '{}'", config.name))?;
                 health.lock().await.info = Some(info.clone());
                 let executor = RemoteExecutor::new(tunnel.local.clone(), online.clone());
+                socket = Some(tunnel.local.clone());
                 tokio::spawn(tunnel.supervise(child, online.clone(), health.clone()));
                 (Arc::new(executor), info.resources)
             }
@@ -241,7 +244,7 @@ pub async fn connect(configs: Vec<NodeConfig>, local: &SystemResources)
                        gpu_count = resources.gpus.len(), "node ready");
 
         pools.push(ResourcePool::new(resources));
-        nodes.push(Node { name: config.name, ssh: config.ssh, executor, online, health });
+        nodes.push(Node { name: config.name, ssh: config.ssh, executor, socket, online, health });
     }
     Ok((nodes, pools))
 }

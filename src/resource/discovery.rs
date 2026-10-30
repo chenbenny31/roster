@@ -13,6 +13,8 @@ pub struct GpuInfo {
     pub index: u32,
     pub name: String,
     pub vram_mb: u64,
+    #[serde(default)]
+    pub uuid: String, // from NVML; empty in a declared inventory
 }
 
 /// Discover available system resource, log warning on NVML failure
@@ -60,7 +62,8 @@ fn discover_gpus() -> Vec<GpuInfo> {
                             let vram_mb = device.memory_info()
                                 .map(|info| info.total / 1024 / 1024)
                                 .unwrap_or(0);
-                            gpus.push(GpuInfo { index, name, vram_mb });
+                            let uuid = device.uuid().unwrap_or_default();
+                            gpus.push(GpuInfo { index, name, vram_mb, uuid });
                         }
                     }
                 }

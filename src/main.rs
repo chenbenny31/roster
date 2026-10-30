@@ -68,6 +68,11 @@ enum Command {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    /// Manage GPUs on a node
+    Gpu {
+        #[command(subcommand)]
+        command: GpuCommand,
+    },
     /// Submit a workflow YAML
     Submit {
         #[arg(help = "path to workflow YAML")]
@@ -107,6 +112,17 @@ enum NodeCommand {
     Rm {
         #[arg(help = "node name")]
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GpuCommand {
+    /// Put a quarantined GPU back in service
+    Clear {
+        #[arg(help = "node name, see `roster node ls`; `local` for this machine")]
+        node: String,
+        #[arg(help = "GPU index on that node")]
+        gpu: u32,
     },
 }
 
@@ -161,6 +177,13 @@ async fn main() -> anyhow::Result<()> {
                      target, info.resources.cpu_cores, info.resources.memory_mb, info.resources.gpus.len());
         },
         Command::Node { command: NodeCommand::Ls } => list_nodes().await?,
+        Command::Gpu { command: GpuCommand::Clear { node, gpu } } => {
+            match client::send(Request::ClearGpu { node: Some(node.clone()), gpu }).await? {
+                Response::GpuCleared => println!("GPU {} on {} is back in service", gpu, node),
+                Response::Error { message } => bail!("{}", message),
+                other => bail!("unexpected reply: {:?}", other),
+            }
+        },
         Command::Node { command: NodeCommand::Rm { name } } => {
             node::remove(&nodes_path(), &name)?;
             println!("removed {}; run `roster restart` to apply", name);
@@ -407,8 +430,10 @@ fn print_info(info: &NodeInfo) {
     }
     for gpu in &info.resources.gpus {
         let health = info.gpu_health.iter().find(|health| health.index == gpu.index);
-        println!("gpu {:<3} {}, {} MB{}", gpu.index, gpu.name, gpu.vram_mb,
-                 health.map(|health| health.to_string()).unwrap_or_default());
+        let quarantined = health.and_then(|health| health.quarantined.as_ref());
+        println!("gpu {:<3} {}, {} MB{}{}", gpu.index, gpu.name, gpu.vram_mb,
+                 health.map(|health| health.to_string()).unwrap_or_default(),
+                 quarantined.map(|reason| format!(", quarantined: {}", reason)).unwrap_or_default());
     }
 }
 
@@ -450,9 +475,9 @@ fn print_node(status: &NodeStatus) {
     }
     for (gpu, free) in status.total.gpus.iter().zip(&status.free_vram_mb) {
         let health = status.gpu_health.iter().find(|health| health.index == gpu.index);
-        let outside = *free == gpu.vram_mb && health.is_some_and(|health| health.busy());
+        let blocked = health.and_then(|health| health.blocked(*free == gpu.vram_mb));
         println!("gpu {:<3} {}, {}/{} MB free{}{}", gpu.index, gpu.name, free, gpu.vram_mb,
                  health.map(|health| health.to_string()).unwrap_or_default(),
-                 if outside { ", in use outside roster" } else { "" });
+                 blocked.map(|reason| format!(", not handed out: {}", reason)).unwrap_or_default());
     }
 }

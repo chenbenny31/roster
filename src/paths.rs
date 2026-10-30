@@ -64,6 +64,16 @@ pub fn nodes_path() -> PathBuf {
         .join("nodes.yaml")
 }
 
+/// GPUs quarantined on this machine after a hardware fault: ~/.local/share/roster/quarantine.json
+pub fn quarantine_path() -> PathBuf {
+    let home = std::env::var_os("HOME").expect("HOME not set");
+    PathBuf::from(home)
+        .join(".local")
+        .join("share")
+        .join("roster")
+        .join("quarantine.json")
+}
+
 /// systemd user unit written by `roster enable`: ~/.config/systemd/user/roster.service
 pub fn unit_path() -> PathBuf {
     let home = std::env::var_os("HOME").expect("HOME not set");

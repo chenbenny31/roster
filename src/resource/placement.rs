@@ -39,7 +39,7 @@ mod tests {
 
     fn node(cpu: u32, gpu_vram_mb: &[u64]) -> ResourcePool {
         let gpus = gpu_vram_mb.iter().enumerate()
-            .map(|(index, &vram_mb)| GpuInfo { index: index as u32, name: "fake".into(), vram_mb })
+            .map(|(index, &vram_mb)| GpuInfo { index: index as u32, name: "fake".into(), vram_mb, uuid: String::new() })
             .collect();
         ResourcePool::new(SystemResources { cpu_cores: cpu, memory_mb: 8_000, gpus })
     }

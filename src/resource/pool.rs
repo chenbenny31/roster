@@ -24,7 +24,7 @@ pub struct ResourcePool {
     pub available_cpu:       u32,
     pub available_memory_mb: u64,
     pub available_vram_mb:   Vec<u64>, // per GPU, indexed by GpuInfo.index
-    pub outside_use:         Vec<bool>, // per GPU: nothing booked but processes on it, not handed out
+    pub blocked:             Vec<bool>, // per GPU: quarantined, or busy or throttled while idle; not handed out
 }
 
 impl ResourcePool {
@@ -35,7 +35,7 @@ impl ResourcePool {
             available_cpu:       resources.cpu_cores,
             available_memory_mb: resources.memory_mb,
             available_vram_mb,
-            outside_use:         vec![false; resources.gpus.len()],
+            blocked:             vec![false; resources.gpus.len()],
             total:               resources,
         }
     }
@@ -111,7 +111,7 @@ impl ResourcePool {
         let selected: Vec<GpuAllocation> = self.total.gpus
             .iter()
             .filter(|gpu| gpu.vram_mb > 0 && self.available_vram_mb[gpu.index as usize] == gpu.vram_mb)
-            .filter(|gpu| !self.outside_use[gpu.index as usize])
+            .filter(|gpu| !self.blocked[gpu.index as usize])
             .filter(|gpu| gpu.vram_mb >= spec.vram_per_gpu())
             .take(spec.gpu as usize)
             .map(|gpu| GpuAllocation { index: gpu.index, vram_mb: gpu.vram_mb }) // the whole card
@@ -144,7 +144,7 @@ mod tests {
     }
 
     fn gpu(index: u32, vram_mb: u64) -> GpuInfo {
-        GpuInfo { index, name: format!("GPU{}", index), vram_mb }
+        GpuInfo { index, name: format!("GPU{}", index), vram_mb, uuid: String::new() }
     }
 
     #[test]
@@ -199,9 +199,9 @@ mod tests {
     }
 
     #[test]
-    fn a_gpu_in_use_outside_roster_is_skipped() {
+    fn a_blocked_gpu_is_skipped() {
         let mut pool = make_pool(16, 32_000, vec![gpu(0, 16_000), gpu(1, 16_000)]);
-        pool.outside_use[0] = true;
+        pool.blocked[0] = true;
         assert_eq!(pool.try_reserve(&gpu_spec(1, 512, 1, 0)).unwrap().gpus[0].index, 1);
         assert!(pool.try_reserve(&gpu_spec(1, 512, 1, 0)).is_none());
         assert!(pool.could_fit(&gpu_spec(1, 512, 2, 0))); // it may free up later

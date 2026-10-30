@@ -17,10 +17,10 @@ use crate::workflow::model::{Execution, JobInstance, JobState};
 
 const TICK_MS: u64 = 100;
 
-/// Cards are checked for processes roster didn't start every 20 ticks (2 s, as often as a node's
-/// health check); one that stays busy this long gets a warning
+/// Cards are checked every 20 ticks (2 s, as often as a node's health check);
+/// one that stays out of placement this long gets a warning
 const GPU_CHECK_TICKS: u64 = 20;
-const GPU_BUSY_WARN: Duration = Duration::from_secs(30);
+const GPU_BLOCKED_WARN: Duration = Duration::from_secs(30);
 
 /// Return each execution's allocation to its own node's pool
 fn release(pools: &mut [ResourcePool], executions: &[Execution]) {
@@ -41,22 +41,21 @@ fn log_path(node: &Node, run_id: &str, job_id: &str) -> PathBuf {
 /// owns the SpmcSender - the single writer to the event ring buffer
 pub async fn run(state: Arc<DaemonState>, event_sender: SpmcSender<JobEvent>) {
     let mut ticker = interval(Duration::from_millis(TICK_MS));
-    let mut busy_since = HashMap::new();
+    let mut blocked_since = HashMap::new();
     for count in 0u64.. {
         ticker.tick().await;
         if count % GPU_CHECK_TICKS == 0 {
-            check_gpu_use(&state, &mut busy_since).await;
+            check_gpus(&state, &mut blocked_since).await;
         }
         tick(&state, &event_sender).await;
     }
 }
 
-/// Keep a card busy with processes roster didn't start out of placement: a job's leftovers or
-/// work started outside roster, holding at least BUSY_VRAM_MB; only cards with nothing booked count,
-/// so a job's own processes never block its card; readings come from each node's last health check,
-/// or NVML on this machine
-/// `busy_since` holds when each blocked card was first seen busy and whether it was warned about
-async fn check_gpu_use(state: &Arc<DaemonState>, busy_since: &mut HashMap<(usize, u32), (Instant, bool)>) {
+/// Keep cards out of placement for as long as `GpuHealth::blocked` gives a reason: quarantined by
+/// their node, or, with nothing booked, busy with processes roster didn't start or throttled;
+/// readings come from each node's last health check, or NVML on this machine
+/// `blocked_since` holds when each blocked card was first seen and whether it was warned about
+async fn check_gpus(state: &Arc<DaemonState>, blocked_since: &mut HashMap<(usize, u32), (Instant, bool)>) {
     // read before taking the pools lock
     let mut readings = Vec::new();
     for node in &state.nodes {
@@ -72,20 +71,23 @@ async fn check_gpu_use(state: &Arc<DaemonState>, busy_since: &mut HashMap<(usize
         for gpu in &pool.total.gpus {
             let health = reading.iter().find(|health| health.index == gpu.index);
             let unbooked = pool.available_vram_mb[gpu.index as usize] == gpu.vram_mb;
-            let blocked = unbooked && health.is_some_and(|health| health.busy());
-            pool.outside_use[gpu.index as usize] = blocked;
+            let reason = health.and_then(|health| health.blocked(unbooked));
+            pool.blocked[gpu.index as usize] = reason.is_some();
 
             let key = (index, gpu.index);
-            if blocked {
-                let (since, warned) = busy_since.entry(key).or_insert((Instant::now(), false));
-                if !*warned && since.elapsed() >= GPU_BUSY_WARN {
-                    let vram_mb = health.and_then(|health| health.process_vram_mb).unwrap_or(0);
-                    tracing::warn!(node = %node.name, gpu = gpu.index, vram_mb,
-                                   "GPU busy with processes roster didn't start; not handed out until they exit");
-                    *warned = true;
+            match reason {
+                Some(reason) => {
+                    let (since, warned) = blocked_since.entry(key).or_insert((Instant::now(), false));
+                    if !*warned && since.elapsed() >= GPU_BLOCKED_WARN {
+                        tracing::warn!(node = %node.name, gpu = gpu.index, %reason, "GPU not handed out");
+                        *warned = true;
+                    }
                 }
-            } else if let Some((_, true)) = busy_since.remove(&key) {
-                tracing::info!(node = %node.name, gpu = gpu.index, "GPU free again");
+                None => {
+                    if let Some((_, true)) = blocked_since.remove(&key) {
+                        tracing::info!(node = %node.name, gpu = gpu.index, "GPU free again");
+                    }
+                }
             }
         }
     }
