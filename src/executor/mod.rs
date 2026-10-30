@@ -14,9 +14,17 @@ pub struct JobHandle {
 }
 
 impl JobHandle {
-    /// Construct a handle for a plain host process (ShellExecutor)
-    pub(crate) fn process(host_pid: u32) -> Self {
-        Self { host_pid, backend: Backend::Process }
+    /// Construct a handle for a host process (ShellExecutor); `scope` is the systemd scope holding it, if any
+    pub(crate) fn process(host_pid: u32, scope: Option<String>) -> Self {
+        Self { host_pid, backend: Backend::Process { scope } }
+    }
+
+    /// The systemd scope unit holding a local job's processes, if it runs in one
+    pub(crate) fn scope(&self) -> Option<&str> {
+        match &self.backend {
+            Backend::Process { scope } => scope.as_deref(),
+            _ => None,
+        }
     }
 
     /// Construct a handle for an execution on another node (RemoteExecutor)
@@ -29,7 +37,7 @@ impl JobHandle {
 /// Concrete executor produced a handle and specific identity to operate job later
 #[derive(Debug, Clone)]
 enum Backend {
-    Process,
+    Process { scope: Option<String> }, // the scope is a cgroup holding the job and everything it starts
     #[allow(dead_code)]
     Container(String),
     Remote { run_id: String, job_id: String }, // the node's name for the execution

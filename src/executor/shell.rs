@@ -1,6 +1,7 @@
 use std::fs;
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use nix::sys::signal::{killpg, Signal};
@@ -43,7 +44,18 @@ impl Executor for ShellExecutor {
             .collect::<Vec<_>>()
             .join(",");
 
-        let mut command = Command::new("sh");
+        // each job gets a scope, a cgroup that holds everything it starts, inside roster.slice;
+        // systemd-run moves itself into it and execs sh, so the pid and exit code stay ours
+        let scope = scopes_available().then(|| format!("roster-{}", uuid::Uuid::new_v4().simple()));
+        let mut command = match &scope {
+            Some(unit) => {
+                let mut command = Command::new("systemd-run");
+                command.args(["--user", "--scope", "--quiet", "--collect", "--slice", SLICE, "--unit", unit]);
+                command.args(["-p", "TimeoutStopSec=5", "sh"]);
+                command
+            }
+            None => Command::new("sh"),
+        };
         command
             .arg("-c")
             .arg(&job.spec.command)
@@ -70,8 +82,8 @@ impl Executor for ShellExecutor {
         // poll() via waitpid reaps the zombie when it exits
         drop(child);
 
-        tracing::info!(host_pid, job_id = %job.job_id, cuda_visible_devices = %gpu_indices, "job launched");
-        Ok(JobHandle::process(host_pid))
+        tracing::info!(host_pid, job_id = %job.job_id, cuda_visible_devices = %gpu_indices, ?scope, "job launched");
+        Ok(JobHandle::process(host_pid, scope))
     }
 
     /// Non-blocking process check via waitpid(WNOHANG)
@@ -80,8 +92,14 @@ impl Executor for ShellExecutor {
 
         match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => Ok(PollResult::Running),
-            Ok(WaitStatus::Exited(_, exit_code)) => Ok(PollResult::Exited { exit_code }),
-            Ok(WaitStatus::Signaled(_, _, _)) => Ok(PollResult::Exited { exit_code: -1 }),
+            Ok(WaitStatus::Exited(_, exit_code)) => {
+                stop_scope(handle).await;
+                Ok(PollResult::Exited { exit_code })
+            }
+            Ok(WaitStatus::Signaled(_, _, _)) => {
+                stop_scope(handle).await;
+                Ok(PollResult::Exited { exit_code: -1 })
+            }
             Ok(_) => Ok(PollResult::Running),
             Err(Errno::ECHILD) => Ok(PollResult::Exited { exit_code: 0 }), // already reaped by tokio
             Err(nix_error) => Err(ExecutorError::WaitFailed(nix_error.into())),
@@ -100,7 +118,57 @@ impl Executor for ShellExecutor {
         // SIGKILL, force kill if still alive, ignore error
         let _ = killpg(pgid, Signal::SIGKILL);
 
+        stop_scope(handle).await; // processes that left the group
         Ok(())
+    }
+}
+
+/// Parent of every job's scope; its memory cap keeps all jobs together within what the pool books
+const SLICE: &str = "roster.slice";
+
+/// Cap the RAM all jobs on this machine may use together, so the system and the daemon keep the rest;
+/// no swap either, since Fedora's zram swap would take that RAM anyway; no per-job caps
+pub fn limit_jobs(memory_mb: u64) {
+    if !scopes_available() {
+        return;
+    }
+    let memory = format!("MemoryMax={}M", memory_mb);
+    match Command::new("systemctl")
+        .args(["--user", "set-property", "--runtime", SLICE, &memory, "MemorySwapMax=0"])
+        .status()
+    {
+        Ok(status) if status.success() => tracing::info!(memory_mb, "jobs limited together in {}", SLICE),
+        other => tracing::warn!(?other, "could not limit {}, jobs run without a memory cap", SLICE),
+    }
+}
+
+/// Whether jobs can run in systemd scopes; probed once by running `true` in one
+fn scopes_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let available = Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !available {
+            tracing::warn!("no systemd user manager: jobs run without cgroups");
+        }
+        available
+    })
+}
+
+/// Stop a job's scope, killing whatever it left running (SIGTERM, SIGKILL after 5 s);
+/// returns once the scope is gone, so its resources can be reused; a scope already gone is fine
+async fn stop_scope(handle: &JobHandle) {
+    if let Some(unit) = handle.scope() {
+        let _ = tokio::process::Command::new("systemctl")
+            .args(["--user", "stop", &format!("{}.scope", unit)])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
     }
 }
 
@@ -187,5 +255,36 @@ mod tests {
         let log_path = job_log_path("test-run-004", "gpu-echo-job");
         let contents = fs::read_to_string(&log_path).unwrap();
         assert!(contents.contains("1"));
+    }
+
+    // needs a systemd user manager; without one it passes trivially
+    #[tokio::test]
+    async fn exit_stops_what_the_job_left_running() {
+        if !scopes_available() {
+            return;
+        }
+        let executor = ShellExecutor;
+        let pid_file = std::env::temp_dir().join(format!("roster-{}.pid", uuid::Uuid::new_v4()));
+        // setsid leaves the process group, so killpg alone would miss it
+        let job = make_job("leaver", &format!("setsid sleep 300 & echo $! > {}", pid_file.display()));
+        let handle = executor.launch("test-run-leaver", &job, &cpu_only_placement()).await.unwrap();
+        assert!(handle.scope().is_some());
+        let exit_code = loop {
+            if let PollResult::Exited { exit_code } = executor.poll(&handle).await.unwrap() {
+                break exit_code;
+            }
+            sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(exit_code, 0);
+
+        let pid: i32 = fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        fs::remove_file(&pid_file).unwrap();
+        for _ in 0..20 {
+            if nix::sys::signal::kill(Pid::from_raw(pid), None).is_err() {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        panic!("pid {} outlived its job", pid);
     }
 }

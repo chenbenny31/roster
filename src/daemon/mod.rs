@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::sync::Arc; // atomic reference counting for shared ownership across threads
 use std::sync::atomic::AtomicU64;
 
@@ -66,9 +68,9 @@ impl DaemonState {
 /// enforce single instance, write PID file, bind socket, run until signal
 /// `resources` is this machine's inventory, `nodes` and `pools` what the scheduler places on
 pub async fn run(resources: SystemResources, nodes: Vec<Node>, pools: Vec<ResourcePool>) -> anyhow::Result<()> {
-    check_not_running()?;
-    write_pid_file()?;
+    let _pid_lock = lock_pid_file(&pid_path())?; // held until run returns
     cleanup_stale_socket();
+    crate::executor::shell::limit_jobs(resources.memory_mb);
 
     let store = RunStore::open(&db_path()).await?;
     tracing::info!(path = %db_path().display(), "databased opened");
@@ -83,45 +85,22 @@ pub async fn run(resources: SystemResources, nodes: Vec<Node>, pools: Vec<Resour
     result
 }
 
-/// Refuse to start if another roster aemon is running
-fn check_not_running() -> Result<(), RosterError> {
-    let path = pid_path();
-
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(_) => return Ok(()), // no PID file means no running daemon
-    };
-
-    let pid: u32 = match contents.trim().parse() {
-        Ok(pid) => pid,
-        Err(_) => return Ok(()), // corrupt PID file
-    };
-
-    // kill (pid, 0) checks if proc exists (no signal)
-    let pid = nix::unistd::Pid::from_raw(pid as i32);
-    match nix::sys::signal::kill(pid, None) { // kill(pid, 0) existence check no signal
-        Ok(_) => Err(RosterError::AlreadyRunning(pid.as_raw() as u32)),
-        Err(_) => Ok(()), // proc gone, stale PID file
-    }
-}
-
-/// Write current PID to pid file atomically (O_CREAT|O_EXCL)
-fn write_pid_file() -> anyhow::Result<()> {
-    let path = pid_path();
-
+/// Single instance: an exclusive flock on the pid file, held for the daemon's life;
+/// the kernel drops it on any exit, even SIGKILL, so a file left by a crash never blocks a restart
+fn lock_pid_file(path: &Path) -> anyhow::Result<fs::File> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let mut file = fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(path)?;
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true) // O_CREAT | O_EXCL, fails if existing
-        .open(&path)?;
-
-    // chmod 0600, only owner can rw
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    // LOCK_NB: fail at once instead of waiting for the running daemon to exit
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let pid = fs::read_to_string(path).ok().and_then(|text| text.trim().parse().ok()).unwrap_or(0);
+        return Err(RosterError::AlreadyRunning(pid).into());
+    }
+    file.set_len(0)?;
     write!(file, "{}", std::process::id())?;
-    Ok(())
+    Ok(file)
 }
 
 /// Remove remain socket file from prev crash
@@ -188,4 +167,23 @@ async fn listen(state: Arc<DaemonState>) -> anyhow::Result<()> {
     .ok();
 
     Ok(())
+}
+
+// tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_lock_is_exclusive_and_ignores_a_stale_file() {
+        let path = std::env::temp_dir().join(format!("roster-{}.pid", uuid::Uuid::new_v4()));
+        fs::write(&path, "1").unwrap(); // left by a crash; pid 1 is alive but not a roster daemon
+        let held = lock_pid_file(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), std::process::id().to_string());
+        assert!(lock_pid_file(&path).is_err()); // a second daemon is refused
+        drop(held);
+        assert!(lock_pid_file(&path).is_ok()); // the lock goes away with its holder
+        fs::remove_file(&path).unwrap();
+    }
 }

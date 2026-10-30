@@ -16,15 +16,17 @@ pub struct GpuInfo {
 }
 
 /// Discover available system resource, log warning on NVML failure
+/// memory is what jobs may use: total minus headroom for the system and the daemon, max(10%, 1 GB)
 pub fn discover() -> SystemResources {
     let mut system = System::new_all();
     system.refresh_all();
 
     let cpu_cores = system.cpus().len() as u32;
-    let memory_mb = system.total_memory() / 1024 / 1024;
+    let total_mb = system.total_memory() / 1024 / 1024;
+    let memory_mb = total_mb.saturating_sub((total_mb / 10).max(1024));
     let gpus = discover_gpus();
 
-    tracing::info!(cpu_cores, memory_mb, gpu_count = gpus.len(), "system resource discovered");
+    tracing::info!(cpu_cores, total_mb, memory_mb, gpu_count = gpus.len(), "system resource discovered");
 
     SystemResources { cpu_cores, memory_mb, gpus }
 }
