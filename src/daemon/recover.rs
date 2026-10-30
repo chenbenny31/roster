@@ -85,6 +85,7 @@ fn restore(job: &mut JobInstance, row: &JobRow) {
     job.started_at = row.started_at.as_deref().and_then(parse_time);
     job.ended_at   = row.ended_at.as_deref().and_then(parse_time);
     job.log_path   = row.log_path.as_ref().map(PathBuf::from);
+    job.reason     = row.reason.clone();
 }
 
 fn parse_time(text: &str) -> Option<DateTime<Utc>> {

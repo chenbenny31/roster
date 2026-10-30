@@ -74,6 +74,7 @@ impl Executor for RemoteExecutor {
 
         let host_pid = match self.exchange(stream, request, Duration::from_secs(10)).await {
             Ok(Response::Launched { host_pid }) => host_pid,
+            Ok(Response::Rejected { reason }) => return Err(ExecutorError::Rejected(reason)),
             Ok(other) => return Err(ExecutorError::Remote(format!("unexpected reply: {:?}", other))),
             Err(ExecutorError::Unreachable(reason)) => {
                 tracing::warn!(%run_id, job_id = %job.job_id, %reason, "launch reply lost, next poll decides");

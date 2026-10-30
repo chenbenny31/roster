@@ -210,6 +210,8 @@ pub struct JobInstance {
     pub ended_at:   Option<DateTime<Utc>>,
     pub exit_code:  Option<i32>,
     pub log_path:   Option<PathBuf>,
+    pub rejected:   Vec<(usize, String)>, // nodes that turned the job down, and why; not tried again for it
+    pub reason:     Option<String>,       // which nodes turned it down and why, or why it failed without running
 }
 
 impl JobInstance {
@@ -225,7 +227,13 @@ impl JobInstance {
             ended_at:   None,
             exit_code:  None,
             log_path:   None,
+            rejected:   Vec::new(),
+            reason:     None,
         }
+    }
+
+    pub fn rejected_by(&self, node: usize) -> bool {
+        self.rejected.iter().any(|(rejecter, _)| *rejecter == node)
     }
 }
 

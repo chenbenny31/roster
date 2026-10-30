@@ -45,6 +45,7 @@ pub struct JobRow {
     pub started_at: Option<String>,
     pub ended_at:   Option<String>,
     pub log_path:   Option<String>,
+    pub reason:     Option<String>,
 }
 
 impl RunStore {
@@ -87,8 +88,8 @@ impl RunStore {
         .await?;
 
         // columns added later: a run's spec, and a running job's node and allocation, so a restarted
-        // controller can take the run back
-        for (table, column) in [("runs", "spec_json"), ("jobs", "node"), ("jobs", "allocation")] {
+        // controller can take the run back; which nodes turned a job down, or why it failed without running
+        for (table, column) in [("runs", "spec_json"), ("jobs", "node"), ("jobs", "allocation"), ("jobs", "reason")] {
             add_column(&pool, table, column).await?;
         }
 
@@ -120,8 +121,8 @@ impl RunStore {
         };
         sqlx::query(
             "INSERT OR REPLACE INTO jobs
-             (run_id, job_id, state, exit_code, started_at, ended_at, log_path, node, allocation)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (run_id, job_id, state, exit_code, started_at, ended_at, log_path, node, allocation, reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(run_id)
         .bind(&job.job_id)
@@ -132,6 +133,7 @@ impl RunStore {
         .bind(job.log_path.as_ref().map(|p| p.to_string_lossy().into_owned()))
         .bind(node)
         .bind(allocation)
+        .bind(&job.reason)
         .execute(&self.pool)
         .await?;
 
@@ -167,7 +169,7 @@ impl RunStore {
         for run in runs {
             let run_id: String = run.get("run_id");
             let jobs = sqlx::query(
-                "SELECT run_id, job_id, state, exit_code, started_at, ended_at, log_path, node, allocation
+                "SELECT run_id, job_id, state, exit_code, started_at, ended_at, log_path, node, allocation, reason
                  FROM jobs WHERE run_id = ?",
             )
             .bind(&run_id)
@@ -188,6 +190,7 @@ impl RunStore {
                         started_at: row.get("started_at"),
                         ended_at:   row.get("ended_at"),
                         log_path:   row.get("log_path"),
+                        reason:     row.get("reason"),
                     },
                 }).collect(),
             });
@@ -275,7 +278,7 @@ impl RunStore {
     /// List all jobs for a run ordered by job_id
     pub async fn list_jobs(&self, run_id: &str) -> anyhow::Result<Vec<JobRow>> {
         let rows = sqlx::query(
-            "SELECT run_id, job_id, state, exit_code, started_at, ended_at, log_path
+            "SELECT run_id, job_id, state, exit_code, started_at, ended_at, log_path, reason
              FROM jobs WHERE run_id = ? ORDER BY job_id",
         )
         .bind(run_id)
@@ -290,6 +293,7 @@ impl RunStore {
             started_at: row.get("started_at"),
             ended_at: row.get("ended_at"),
             log_path: row.get("log_path"),
+            reason: row.get("reason"),
         }).collect())
     }
 }
@@ -379,6 +383,24 @@ mod tests {
 
         store.interrupt("run-1", "train").await.unwrap();
         assert!(store.unfinished_runs().await.unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_job_that_failed_without_running_keeps_why() {
+        let path = std::env::temp_dir().join(format!("roster-store-{}.db", uuid::Uuid::new_v4()));
+        let store = RunStore::open(&path).await.unwrap();
+        let spec = spec::parse("name: t\njobs:\n  - id: typo\n    command: pythn train.py\n").unwrap();
+        let mut run = WorkflowRun::new("run-1".into(), 0, spec, 0);
+        store.upsert_run(&run).await.unwrap();
+
+        let typo = run.jobs.get_mut("typo").unwrap();
+        typo.state  = JobState::Failed;
+        typo.reason = Some("turned down by local: 'pythn' not found on PATH /usr/bin".into());
+        store.upsert_job("run-1", typo, None).await.unwrap();
+
+        let jobs = store.list_jobs("run-1").await.unwrap();
+        assert_eq!(jobs[0].reason.as_deref(), Some("turned down by local: 'pythn' not found on PATH /usr/bin"));
         std::fs::remove_file(&path).ok();
     }
 }

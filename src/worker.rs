@@ -51,6 +51,7 @@ impl Worker {
                 processes.insert(key, JobProcess { handle, exit_code: None });
                 Response::Launched { host_pid }
             }
+            Err(ExecutorError::Rejected(reason)) => Response::Rejected { reason },
             Err(error) => Response::Error { message: format!("launch failed: {}", error) },
         }
     }

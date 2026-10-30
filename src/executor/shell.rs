@@ -28,6 +28,7 @@ impl Executor for ShellExecutor {
         if let Some(handle) = ShellExecutor::find(run_id, &job.job_id).await {
             return Ok(handle);
         }
+        check_program(&job.spec.command).map_err(ExecutorError::Rejected)?;
         let log_path = job_log_path(run_id, &job.job_id);
 
         if let Some(parent) = log_path.parent() {
@@ -250,6 +251,58 @@ pub fn scopes_available() -> bool {
     })
 }
 
+/// Words sh runs itself, so there's no file to look for
+const SHELL_WORDS: &[&str] = &[
+    ".", ":", "[", "alias", "break", "case", "cd", "command", "continue", "eval", "exec", "exit", "export",
+    "for", "if", "read", "readonly", "return", "set", "shift", "source", "test", "time", "trap", "ulimit",
+    "umask", "unset", "until", "wait", "while",
+];
+
+/// Whether the program a job's command starts with is on this machine, so a node without it turns the job
+/// down instead of failing it with exit 127; jobs inherit this daemon's PATH and working directory, so the
+/// lookup here is the one sh would do. A first word sh expands or runs itself is left for sh to judge
+fn check_program(command: &str) -> Result<(), String> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let assignments = words.iter().take_while(|word| is_assignment(word)).count();
+    // `PATH=... prog` looks prog up on its own PATH
+    if words[..assignments].iter().any(|word| word.starts_with("PATH=")) {
+        return Ok(());
+    }
+    let Some(&program) = words.get(assignments) else {
+        return Ok(());
+    };
+    if SHELL_WORDS.contains(&program) || program.contains(|c: char| "$`'\"\\(){}[]*?~;&|<>!#=".contains(c)) {
+        return Ok(());
+    }
+
+    if program.contains('/') {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        return match is_executable(&cwd.join(program)) {
+            true  => Ok(()),
+            false => Err(format!("'{}' is not an executable file (working directory {})", program, cwd.display())),
+        };
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    match std::env::split_paths(&path).any(|dir| is_executable(&dir.join(program))) {
+        true  => Ok(()),
+        false => Err(format!("'{}' not found on PATH {} (jobs don't read .bashrc; give the program's full path)", program, path)),
+    }
+}
+
+/// `NAME=value` before a command sets a variable for it
+fn is_assignment(word: &str) -> bool {
+    match word.split_once('=') {
+        Some((name, _)) => name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        None => false,
+    }
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
 /// Stop a job's scope, killing whatever it left running (SIGTERM, SIGKILL after 5 s);
 /// returns once the scope is gone, so its resources can be reused; a scope already gone is fine
 async fn stop_scope(unit: &str) {
@@ -433,5 +486,35 @@ mod tests {
             sleep(Duration::from_millis(100)).await;
         }
         panic!("pid {} outlived its job", pid);
+    }
+
+    #[test]
+    fn a_command_is_checked_by_its_first_program() {
+        assert!(check_program("sh -c true").is_ok());
+        assert!(check_program("/bin/sh -c true").is_ok());
+        assert!(check_program("NCCL_DEBUG=INFO sh -c true").is_ok());
+        let reason = check_program("no-such-program-1f2e --flag").unwrap_err();
+        assert!(reason.contains("not found on PATH") && reason.contains(".bashrc"), "{}", reason);
+        assert!(check_program("NCCL_DEBUG=INFO no-such-program-1f2e").is_err());
+        assert!(check_program("/no/such/dir/train.sh").unwrap_err().contains("not an executable file"));
+        // cargo runs tests in the crate root, where Cargo.toml is a file but not executable
+        assert!(check_program("./Cargo.toml").is_err());
+    }
+
+    #[test]
+    fn what_sh_expands_or_runs_itself_is_left_to_sh() {
+        for command in ["\"$ROSTER_BIN\" qualify --index 0", "cd /tmp && no-such-program-1f2e",
+                        "PATH=/opt/x no-such-program-1f2e", "(no-such-program-1f2e)", "~/bin/train", ""] {
+            assert!(check_program(command).is_ok(), "{}", command);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_program_is_rejected_before_launch() {
+        let job = make_job("typo", "no-such-program-1f2e");
+        let run = run_id("test-run-typo");
+        let result = ShellExecutor.launch(&run, &job, &cpu_only_placement()).await;
+        assert!(matches!(result, Err(ExecutorError::Rejected(_))));
+        assert!(!job_log_path(&run, "typo").exists());
     }
 }

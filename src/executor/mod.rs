@@ -83,6 +83,10 @@ pub enum ExecutorError {
     /// The node answered with an error
     #[error("node error: {0}")]
     Remote(String),
+
+    /// The node turned the job down before starting it, e.g. its program isn't there; another node may run it
+    #[error("rejected: {0}")]
+    Rejected(String),
 }
 
 /// Trait for job executors, MVP implements ShellExecutor

@@ -327,8 +327,11 @@ async fn advance_queued(state: &Arc<DaemonState>, event_sender: &SpmcSender<JobE
                 if !matches!(job.state, JobState::Queued) {
                     continue;
                 }
+                let usable: Vec<bool> = online.iter().enumerate()
+                    .map(|(node, &up)| up && !job.rejected_by(node))
+                    .collect();
                 // one member per job until coordinated jobs add a member count
-                if let Some(placement) = place(&mut pools, &online, std::slice::from_ref(&job.spec.resources)) {
+                if let Some(placement) = place(&mut pools, &usable, std::slice::from_ref(&job.spec.resources)) {
                     tasks.push(AdmitTask {
                         run_id: run.run_id.clone(),
                         job_instance: job.clone(),
@@ -401,12 +404,35 @@ async fn advance_queued(state: &Arc<DaemonState>, event_sender: &SpmcSender<JobE
                     tracing::debug!(run_id = %outcome.run_id, job_id = %outcome.job_id, %reason, "node unreachable, job stays Queued");
                     release(&mut pools, &outcome.executions);
                 }
+                // the node won't run it, so the job waits for another node, or fails once no other node could take it;
+                // either way `roster status` says which nodes turned it down and why
+                Err(ExecutorError::Rejected(reason)) => {
+                    let node = outcome.executions[0].node; // one member per job for now
+                    tracing::warn!(run_id = %outcome.run_id, job_id = %outcome.job_id, node = %state.nodes[node].name, %reason, "node turned the job down");
+                    release(&mut pools, &outcome.executions);
+                    job.rejected.push((node, reason));
+                    let reasons: Vec<String> = job.rejected.iter()
+                        .map(|(node, reason)| format!("{}: {}", state.nodes[*node].name, reason))
+                        .collect();
+                    job.reason = Some(format!("turned down by {}", reasons.join("; ")));
+
+                    let options = job.spec.resources.gpu_options();
+                    let could_go_elsewhere = pools.iter().enumerate()
+                        .any(|(node, pool)| !job.rejected_by(node) && options.iter().any(|option| pool.could_fit(option)));
+                    if !could_go_elsewhere {
+                        tracing::error!(run_id = %outcome.run_id, job_id = %outcome.job_id, "every node that fits turned the job down -> Failed");
+                        job.state    = JobState::Failed;
+                        job.ended_at = Some(Utc::now());
+                    }
+                    to_write.push((outcome.run_id, outcome.job_id));
+                }
                 Err(error) => {
                     tracing::error!(run_id = %outcome.run_id, job_id = %outcome.job_id, %error, "launch failed -> Failed");
                     // with several members, the ones already launched must be stopped first
                     release(&mut pools, &outcome.executions);
                     job.state    = JobState::Failed;
                     job.ended_at = Some(Utc::now());
+                    job.reason   = Some(error.to_string());
                     to_write.push((outcome.run_id, outcome.job_id));
                 }
             }

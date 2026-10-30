@@ -50,6 +50,7 @@ pub enum Response {
     Recorded,
 
     Launched { host_pid: u32 },
+    Rejected { reason: String },         // the node won't run this job; the controller tries another node
     Polled   { exit_code: Option<i32> }, // None while running
     Killed,
 }
@@ -101,6 +102,7 @@ pub struct JobDetail {
     pub started_at: Option<String>,
     pub ended_at:   Option<String>,
     pub log_path:   Option<String>,
+    pub reason:     Option<String>, // which nodes turned it down and why, or why it failed without running
 }
 
 
@@ -162,6 +164,10 @@ mod tests {
         let Response::Info(node) = round_trip_response(info) else { panic!() };
         assert_eq!(node.running_jobs, 2);
         assert_eq!(node.resources.cpu_cores, 4);
+
+        let rejected = Response::Rejected { reason: "'pythn' not found on PATH /usr/bin".into() };
+        let Response::Rejected { reason } = round_trip_response(rejected) else { panic!() };
+        assert!(reason.contains("pythn"));
     }
 
     #[test]

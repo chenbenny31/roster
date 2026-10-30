@@ -219,6 +219,7 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
                         started_at: j.started_at,
                         ended_at: j.ended_at,
                         log_path: j.log_path,
+                        reason: j.reason,
                     }).collect(),
                 },
             }
