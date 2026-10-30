@@ -233,8 +233,8 @@ pub fn limit_jobs(memory_mb: u64) {
     }
 }
 
-/// Whether jobs can run in systemd scopes; probed once by running `true` in one
-fn scopes_available() -> bool {
+/// Whether jobs can run in systemd scopes, which outlive this daemon; probed once by running `true` in one
+pub fn scopes_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         let available = Command::new("systemd-run")

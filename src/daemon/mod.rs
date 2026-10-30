@@ -13,6 +13,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration};
 
+mod recover;
+
 use crate::broadcast::{self as spmc, SpmcSubscriber};
 use crate::error::RosterError;
 use crate::event::JobEvent;
@@ -77,8 +79,8 @@ pub async fn run(resources: SystemResources, nodes: Vec<Node>, pools: Vec<Resour
 
     let store = RunStore::open(&db_path()).await?;
     tracing::info!(path = %db_path().display(), "databased opened");
-    store.reconcile_interrupted().await?;
     let (state, event_sender) = DaemonState::new(resources, nodes, pools, store);
+    recover::take_back_runs(&state).await?;
 
     let result = tokio::select! {
         r = listen(state.clone()) => r,

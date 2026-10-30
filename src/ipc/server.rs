@@ -93,7 +93,7 @@ async fn handle_submit(spec_yaml: String, state: Arc<DaemonState>) -> Response {
 
     let _ = state.store.upsert_run(&run).await;
     for job in run.jobs.values() {
-        let _ = state.store.upsert_job(&run_id, job).await;
+        let _ = state.store.upsert_job(&run_id, job, None).await;
     }
 
     state.runs.lock().await.insert(run_id.clone(), run);
@@ -114,6 +114,7 @@ async fn handle_info(state: Arc<DaemonState>) -> Response {
         pid:          std::process::id(),
         socket:       socket_path().display().to_string(),
         running_jobs: controlled + state.worker.running().await,
+        jobs_survive_restart: crate::executor::shell::scopes_available(),
         resources:    state.resources.clone(),
         gpu_health:   state.gpu_monitor.read(&state.resources.gpus),
     })

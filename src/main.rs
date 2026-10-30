@@ -34,7 +34,7 @@ enum Command {
         #[arg(long, help = "run in this process, e.g. under systemd or in a container")]
         foreground: bool,
     },
-    /// Stop this machine's daemon; refuses while jobs are running
+    /// Stop this machine's daemon; without systemd it refuses while jobs are running
     Stop {
         #[arg(long, help = "stop anyway; running jobs keep running untracked")]
         force: bool,
@@ -406,7 +406,7 @@ async fn stop(force: bool) -> anyhow::Result<()> {
         println!("not running");
         return Ok(());
     };
-    if info.running_jobs > 0 && !force {
+    if info.running_jobs > 0 && !info.jobs_survive_restart && !force {
         bail!("{} jobs are running and would keep running untracked; wait for them or use --force",
               info.running_jobs);
     }

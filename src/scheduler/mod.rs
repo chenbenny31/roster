@@ -218,7 +218,8 @@ async fn flush_transitions(state: &Arc<DaemonState>,
         let runs = state.runs.lock().await;
         if let Some(run) = runs.get(run_id) {
             if let Some(job) = run.jobs.get(job_id) {
-                let _ = state.store.upsert_job(run_id, job).await;
+                let node = job.executions.first().map(|execution| state.nodes[execution.node].name.as_str());
+                let _ = state.store.upsert_job(run_id, job, node).await;
                 event_sender.send(JobEvent::new(
                     run.run_seq,
                     job.job_seq,

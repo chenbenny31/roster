@@ -40,6 +40,18 @@ impl ResourcePool {
         }
     }
 
+    /// Count an allocation already in use, such as a running job taken back after a restart;
+    /// unlike try_reserve it can't refuse
+    pub fn book(&mut self, alloc: &Allocation) {
+        self.available_cpu = self.available_cpu.saturating_sub(alloc.cpu);
+        self.available_memory_mb = self.available_memory_mb.saturating_sub(alloc.memory_mb);
+        for gpu in &alloc.gpus {
+            if let Some(free) = self.available_vram_mb.get_mut(gpu.index as usize) {
+                *free = free.saturating_sub(gpu.vram_mb);
+            }
+        }
+    }
+
     /// Book one whole card for roster's own use, such as a qualification; None when it's taken or reports no VRAM
     pub fn reserve_card(&mut self, index: u32) -> Option<Allocation> {
         let gpu = self.total.gpus.iter().find(|gpu| gpu.index == index)?;

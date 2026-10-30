@@ -273,15 +273,22 @@ impl Tunnel {
             std::fs::create_dir_all(parent)?;
         }
         let forward = format!("{}:{}", self.local.display(), self.remote);
-        let child = Command::new("ssh")
+        let mut command = Command::new("ssh");
+        command
             .args(["-N", "-o", "LogLevel=ERROR", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
             .args(["-o", "ExitOnForwardFailure=yes", "-o", "StreamLocalBindUnlink=yes"])
             .args(["-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3"])
             .args(["-L", &forward, &self.target])
             .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
-        Ok(child)
+            .kill_on_drop(true);
+        // also gone when this daemon is killed outright, so a restarted one finds no stale tunnels
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+        Ok(command.spawn()?)
     }
 
     /// Event: the health check; asks the node daemon for its info through the tunnel
@@ -415,7 +422,7 @@ mod tests {
         assert_eq!(health.since, since);
 
         let resources = SystemResources { cpu_cores: 1, memory_mb: 1024, gpus: vec![] };
-        let info = NodeInfo { version: "0.0.0".into(), pid: 7, socket: "/r.socket".into(), running_jobs: 0, resources, gpu_health: vec![] };
+        let info = NodeInfo { version: "0.0.0".into(), pid: 7, socket: "/r.socket".into(), running_jobs: 0, resources, gpu_health: vec![], jobs_survive_restart: false };
         assert!(health.enter(NodeState::VersionMismatch("node runs roster 0.0.0".into()), Some(info)));
         assert!(!health.state.is_online());
         assert!(health.enter(NodeState::Online, None));

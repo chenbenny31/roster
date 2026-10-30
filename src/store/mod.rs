@@ -1,8 +1,24 @@
 use std::path::Path;
+use chrono::Utc;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Row, SqlitePool};
 
 use crate::workflow::model::{derive_run_state, JobInstance, JobState, WorkflowRun};
+
+/// A run whose jobs hadn't all ended when the daemon stopped
+pub struct SavedRun {
+    pub run_id:     String,
+    pub created_at: String,
+    pub spec_json:  Option<String>, // None for a run stored before specs were kept
+    pub jobs:       Vec<SavedJob>,
+}
+
+/// A job's last stored state, and where it ran
+pub struct SavedJob {
+    pub row:        JobRow,
+    pub node:       Option<String>, // node name while Running
+    pub allocation: Option<String>, // JSON of what it held there
+}
 
 /// Persistent store for run and job state
 /// SQLite is the CLI read source, in-memory DaemonState is scheduler's working set
@@ -70,30 +86,42 @@ impl RunStore {
         .execute(&pool)
         .await?;
 
+        // columns added later: a run's spec, and a running job's node and allocation, so a restarted
+        // controller can take the run back
+        for (table, column) in [("runs", "spec_json"), ("jobs", "node"), ("jobs", "allocation")] {
+            add_column(&pool, table, column).await?;
+        }
+
         Ok(Self { pool })
     }
 
-    /// Write or overwrite the run's identity columns
+    /// Write or overwrite the run's identity columns and its spec
     pub async fn upsert_run(&self, run: &WorkflowRun) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT OR REPLACE INTO runs (run_id, workflow_name, created_at)
-             VALUES (?, ?, ?)",
+            "INSERT OR REPLACE INTO runs (run_id, workflow_name, created_at, spec_json)
+             VALUES (?, ?, ?, ?)",
         )
         .bind(&run.run_id)
         .bind(&run.workflow_name)
         .bind(run.created_at.to_rfc3339())
+        .bind(serde_json::to_string(&run.spec)?)
         .execute(&self.pool)
         .await?;
 
         Ok(())
     }
 
-    /// Write or overwrite a job's current state to SQLite
-    pub async fn upsert_job(&self, run_id: &str, job: &JobInstance) -> anyhow::Result<()> {
+    /// Write or overwrite a job's current state to SQLite; `node` names where it runs, and its allocation
+    /// is kept with it, both empty once it ended
+    pub async fn upsert_job(&self, run_id: &str, job: &JobInstance, node: Option<&str>) -> anyhow::Result<()> {
+        let allocation = match job.executions.first() {
+            Some(execution) => Some(serde_json::to_string(&execution.allocation)?),
+            None => None,
+        };
         sqlx::query(
             "INSERT OR REPLACE INTO jobs
-             (run_id, job_id, state, exit_code, started_at, ended_at, log_path)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (run_id, job_id, state, exit_code, started_at, ended_at, log_path, node, allocation)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(run_id)
         .bind(&job.job_id)
@@ -102,21 +130,69 @@ impl RunStore {
         .bind(job.started_at.as_ref().map(|t| t.to_rfc3339()))
         .bind(job.ended_at.as_ref().map(|t| t.to_rfc3339()))
         .bind(job.log_path.as_ref().map(|p| p.to_string_lossy().into_owned()))
+        .bind(node)
+        .bind(allocation)
         .execute(&self.pool)
         .await?;
 
         Ok(())
     }
 
-    /// On daemon startup: mark any job still Running (from before) as Interrupted
-    pub async fn reconcile_interrupted(&self) -> anyhow::Result<()> {
+    /// A job that can't be taken back after a restart ends as Interrupted
+    pub async fn interrupt(&self, run_id: &str, job_id: &str) -> anyhow::Result<()> {
         sqlx::query(
-            "UPDATE jobs SET state = 'Interrupted' WHERE state = 'Running'",
+            "UPDATE jobs SET state = 'Interrupted', ended_at = ?, node = NULL, allocation = NULL
+             WHERE run_id = ? AND job_id = ?",
         )
+        .bind(Utc::now().to_rfc3339())
+        .bind(run_id)
+        .bind(job_id)
         .execute(&self.pool)
         .await?;
-
         Ok(())
+    }
+
+    /// Runs with a job that hasn't ended, for the controller to take back after a restart
+    pub async fn unfinished_runs(&self) -> anyhow::Result<Vec<SavedRun>> {
+        let runs = sqlx::query(
+            "SELECT run_id, created_at, spec_json FROM runs r
+             WHERE EXISTS (SELECT 1 FROM jobs j WHERE j.run_id = r.run_id
+                           AND j.state IN ('Pending', 'Queued', 'Running'))
+             ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut saved = Vec::new();
+        for run in runs {
+            let run_id: String = run.get("run_id");
+            let jobs = sqlx::query(
+                "SELECT run_id, job_id, state, exit_code, started_at, ended_at, log_path, node, allocation
+                 FROM jobs WHERE run_id = ?",
+            )
+            .bind(&run_id)
+            .fetch_all(&self.pool)
+            .await?;
+            saved.push(SavedRun {
+                run_id,
+                created_at: run.get("created_at"),
+                spec_json:  run.get("spec_json"),
+                jobs: jobs.into_iter().map(|row| SavedJob {
+                    node:       row.get("node"),
+                    allocation: row.get("allocation"),
+                    row: JobRow {
+                        run_id:     row.get("run_id"),
+                        job_id:     row.get("job_id"),
+                        state:      row.get("state"),
+                        exit_code:  row.get("exit_code"),
+                        started_at: row.get("started_at"),
+                        ended_at:   row.get("ended_at"),
+                        log_path:   row.get("log_path"),
+                    },
+                }).collect(),
+            });
+        }
+        Ok(saved)
     }
 
     /// List all runs ordered by creation time descending, with status derived from each run's job
@@ -218,6 +294,19 @@ impl RunStore {
     }
 }
 
+/// Add a TEXT column unless the table has it already; a database from an earlier release lacks it
+async fn add_column(pool: &SqlitePool, table: &str, column: &str) -> anyhow::Result<()> {
+    let present = sqlx::query(&format!("PRAGMA table_info({})", table))
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .any(|row| row.get::<String, _>("name") == column);
+    if !present {
+        sqlx::query(&format!("ALTER TABLE {} ADD COLUMN {} TEXT", table, column)).execute(pool).await?;
+    }
+    Ok(())
+}
+
 /// Accumulates one run's identity plus its jobs' states
 struct RunAccumulator {
     run_id:         String,
@@ -250,5 +339,46 @@ impl RunAccumulator {
             status,
             created_at:    self.created_at,
         }
+    }
+}
+
+// tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::pool::{Allocation, GpuAllocation};
+    use crate::workflow::model::Execution;
+    use crate::workflow::spec::{self, WorkflowSpec};
+
+    #[tokio::test]
+    async fn an_unfinished_run_keeps_its_spec_and_where_its_job_runs() {
+        let path = std::env::temp_dir().join(format!("roster-store-{}.db", uuid::Uuid::new_v4()));
+        let store = RunStore::open(&path).await.unwrap();
+        let spec = spec::parse("name: t\njobs:\n  - id: train\n    command: python train.py\n  - id: done\n    command: 'true'\n").unwrap();
+        let mut run = WorkflowRun::new("run-1".into(), 0, spec, 0);
+        store.upsert_run(&run).await.unwrap();
+
+        let train = run.jobs.get_mut("train").unwrap();
+        train.state = JobState::Running;
+        let gpus = vec![GpuAllocation { index: 1, vram_mb: 24_000 }];
+        train.executions = vec![Execution { node: 2, allocation: Allocation { cpu: 1, memory_mb: 512, gpus }, handle: None }];
+        store.upsert_job("run-1", train, Some("sim-2")).await.unwrap();
+        let done = run.jobs.get_mut("done").unwrap();
+        done.state = JobState::Succeeded;
+        store.upsert_job("run-1", done, None).await.unwrap();
+
+        let saved = store.unfinished_runs().await.unwrap();
+        assert_eq!(saved.len(), 1);
+        let spec: WorkflowSpec = serde_json::from_str(saved[0].spec_json.as_deref().unwrap()).unwrap();
+        assert_eq!(spec.jobs.len(), 2);
+        let train = saved[0].jobs.iter().find(|job| job.row.job_id == "train").unwrap();
+        assert_eq!(train.node.as_deref(), Some("sim-2"));
+        let allocation: Allocation = serde_json::from_str(train.allocation.as_deref().unwrap()).unwrap();
+        assert_eq!(allocation.gpus[0].index, 1);
+
+        store.interrupt("run-1", "train").await.unwrap();
+        assert!(store.unfinished_runs().await.unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -60,7 +60,9 @@ pub struct NodeInfo {
     pub version:      String, // crate version, controller and node must match
     pub pid:          u32,    // `roster stop` signals it
     pub socket:       String, // absolute path of the daemon's socket
-    pub running_jobs: usize,  // as controller or worker; `roster stop` refuses while nonzero
+    pub running_jobs: usize,  // as controller or worker; `roster stop` refuses while nonzero unless they survive it
+    #[serde(default)]
+    pub jobs_survive_restart: bool, // jobs run in systemd scopes, and this daemon takes them back when it starts
     pub resources:    SystemResources,
     #[serde(default)]
     pub gpu_health:   Vec<GpuHealth>, // live readings, empty without NVML
@@ -155,7 +157,7 @@ mod tests {
             socket: "/run/roster.socket".into(),
             running_jobs: 2,
             resources: SystemResources { cpu_cores: 4, memory_mb: 8_000, gpus: vec![] },
-            gpu_health: vec![],
+            gpu_health: vec![], jobs_survive_restart: false,
         });
         let Response::Info(node) = round_trip_response(info) else { panic!() };
         assert_eq!(node.running_jobs, 2);
