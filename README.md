@@ -17,6 +17,7 @@ Roster is in early development; the [roadmap](#roadmap) shows what works today.
 ```bash
 roster run -- python train.py               # returns a job ID once the job is stored
 roster run --gpus 4 -- torchrun --standalone --nproc-per-node=4 train.py
+roster run --vram 140G -- 'vllm serve MODEL --tensor-parallel-size $ROSTER_GPUS'   # fewest GPUs that hold it
 roster jobs [--json]
 roster watch                                # live jobs and nodes
 roster show JOB_ID
@@ -26,7 +27,7 @@ roster next JOB_ID                          # move to the front; never kills run
 roster cancel JOB_ID                        # returns once the stop is stored, completes after cleanup
 roster retry JOB_ID                         # failed jobs wait for this
 roster start                                # on every machine; also stop, restart
-roster enable                               # start at boot and keep running after logout
+roster enable                               # start at boot and keep running after logout; also disable
 roster info [NODE]                          # this machine, or a node as the controller sees it
 roster node add SSH_ALIAS                   # on the controller
 roster node ls                              # also node rm
@@ -86,7 +87,7 @@ Job 17 is stopping and has not released it yet.
 Roster will start this job when cleanup is confirmed.
 ```
 
-**Resources.** A requirement ("one GPU with at least 24 GB"), the claim placement makes (that GPU's UUID), and what the backend enforces are kept separate. GPUs start as exclusive whole devices, and `CUDA_VISIBLE_DEVICES` gets their UUIDs.
+**Resources.** A requirement ("one GPU with at least 24 GB"), the claim placement makes (that GPU's UUID), and what the backend enforces are kept separate. GPUs start as exclusive whole devices, and `CUDA_VISIBLE_DEVICES` gets their UUIDs. A job asks for a GPU count, a total VRAM, or both. With only VRAM, Roster picks the fewest GPUs on one node (1, 2, 4, or 8, the tensor-parallel sizes) that each hold an even share, and `ROSTER_GPUS` tells the job how many it got.
 
 **Unknown stays unknown.** A disconnected node isn't treated as empty, a missing result isn't success, and uncertain work is never started again elsewhere. After any restart, Roster loads unreleased allocations before computing free capacity and then reconciles each worker. Retries are explicit; Roster re-places a job on its own only when it can prove no execution ever got launch permission.
 
@@ -152,8 +153,8 @@ Roster won't:
 
 - Parallelize a program, split datasets, or merge outputs.
 - Copy code or data to nodes, install environments, or provision machines. A profile maps paths per node and is checked before launch.
-- Enforce CPU, RAM, or VRAM limits. Those numbers are admission budgets.
-- Clean up work a job hands off outside its process tree, for example over SSH or to a container daemon.
+- Enforce per-job CPU, RAM, or VRAM limits. Those numbers are admission budgets. All jobs on a node share one memory cap that leaves headroom for the system.
+- Clean up work a job hands off outside its cgroup, for example over SSH or to a container daemon.
 
 Not planned for the first release: checkpoint or migration, MIG/MPS, isolation between untrusted users, container orchestration, an RDMA runtime, and a web dashboard.
 
@@ -178,15 +179,17 @@ S5 comes before S4 because multi-node placement matters more than preemption.
 The current prototype uses its own commands:
 
 ```bash
-cargo build --locked                 # add --features nvml for NVIDIA discovery
-roster start                         # also stop, restart, info
+cargo build --locked                 # add --features nvml for NVIDIA discovery and GPU readings
+roster start                         # also stop, restart, info; enable and disable use systemd
 roster node add SSH_ALIAS            # on the controller, then roster restart; also node ls, node rm
-roster info NODE                     # state, running jobs, free resources
+roster info NODE                     # state, running jobs, free resources, GPU temperature and power
 roster submit examples/cpu-only.yaml
 roster ps
 roster status <run-id>
 roster logs <run-id>/<job-id>
 ```
+
+Each job already runs in its own systemd scope under a memory-capped `roster.slice`, gets whole GPUs, and a GPU busy with work Roster didn't start is skipped until it frees.
 
 Shared GPUs are a separate branch after S3, for example an 8 GB and a 2 GB job on one 16 GB card. They need per-job claims and a validated backend (budgets, MPS, or MIG). A memory split says nothing about compute share.
 
