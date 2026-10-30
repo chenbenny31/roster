@@ -114,19 +114,26 @@ async fn handle_info(state: Arc<DaemonState>) -> Response {
         socket:       socket_path().display().to_string(),
         running_jobs: controlled + state.worker.running().await,
         resources:    state.resources.clone(),
+        gpu_health:   state.gpu_monitor.read(&state.resources.gpus),
     })
 }
 
 /// The nodes this daemon places jobs on: each tunnel's last health check, the jobs placed there, free resources
 async fn handle_nodes(state: Arc<DaemonState>) -> Response {
+    // GPU readings: this machine's read now, other nodes' from their last health check
     let mut health = Vec::new();
     for node in &state.nodes {
-        health.push(node.health().await);
+        let node_health = node.health().await;
+        let gpu_health = match &node.ssh {
+            None => state.gpu_monitor.read(&state.resources.gpus),
+            Some(_) => node_health.info.as_ref().map(|info| info.gpu_health.clone()).unwrap_or_default(),
+        };
+        health.push((node_health, gpu_health));
     }
     let runs = state.runs.lock().await;
     let pools = state.pools.lock().await;
 
-    let nodes = state.nodes.iter().zip(health).enumerate().map(|(index, (node, health))| {
+    let nodes = state.nodes.iter().zip(health).enumerate().map(|(index, (node, (health, gpu_health)))| {
         let running_jobs = runs.values()
             .flat_map(|run| run.jobs.values())
             .filter(|job| job.state == JobState::Running)
@@ -144,6 +151,7 @@ async fn handle_nodes(state: Arc<DaemonState>) -> Response {
             free_cpu:       pool.available_cpu,
             free_memory_mb: pool.available_memory_mb,
             free_vram_mb:   pool.available_vram_mb.clone(),
+            gpu_health,
         }
     }).collect();
     Response::Nodes { nodes }

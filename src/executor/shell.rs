@@ -47,6 +47,7 @@ impl Executor for ShellExecutor {
         command
             .arg("-c")
             .arg(&job.spec.command)
+            .env("CUDA_DEVICE_ORDER", "PCI_BUS_ID") // number GPUs as NVML does, so the indices name the booked cards
             .env("CUDA_VISIBLE_DEVICES", &gpu_indices)
             .stdout(log_file)
             .stderr(stderr_file);

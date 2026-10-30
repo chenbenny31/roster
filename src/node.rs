@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(health.since, since);
 
         let resources = SystemResources { cpu_cores: 1, memory_mb: 1024, gpus: vec![] };
-        let info = NodeInfo { version: "0.0.0".into(), pid: 7, socket: "/r.socket".into(), running_jobs: 0, resources };
+        let info = NodeInfo { version: "0.0.0".into(), pid: 7, socket: "/r.socket".into(), running_jobs: 0, resources, gpu_health: vec![] };
         assert!(health.enter(NodeState::VersionMismatch("node runs roster 0.0.0".into()), Some(info)));
         assert!(!health.state.is_online());
         assert!(health.enter(NodeState::Online, None));

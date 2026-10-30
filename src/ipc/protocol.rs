@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::resource::discovery::SystemResources;
+use crate::resource::health::GpuHealth;
 use crate::resource::pool::Allocation;
 use crate::workflow::model::JobState;
 use crate::workflow::spec::JobSpec;
@@ -57,6 +58,8 @@ pub struct NodeInfo {
     pub socket:       String, // absolute path of the daemon's socket
     pub running_jobs: usize,  // as controller or worker; `roster stop` refuses while nonzero
     pub resources:    SystemResources,
+    #[serde(default)]
+    pub gpu_health:   Vec<GpuHealth>, // live readings, empty without NVML
 }
 
 /// One node as this daemon sees it, printed by `roster node ls` and `roster info NODE`
@@ -72,6 +75,7 @@ pub struct NodeStatus {
     pub free_cpu:       u32,
     pub free_memory_mb: u64,
     pub free_vram_mb:   Vec<u64>,       // per GPU, same order as total.gpus
+    pub gpu_health:     Vec<GpuHealth>, // from the node's last health check; empty without NVML
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -147,6 +151,7 @@ mod tests {
             socket: "/run/roster.socket".into(),
             running_jobs: 2,
             resources: SystemResources { cpu_cores: 4, memory_mb: 8_000, gpus: vec![] },
+            gpu_health: vec![],
         });
         let Response::Info(node) = round_trip_response(info) else { panic!() };
         assert_eq!(node.running_jobs, 2);

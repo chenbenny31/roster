@@ -19,6 +19,7 @@ use crate::node::Node;
 use crate::paths::db_path;
 use crate::paths::{pid_path, socket_path};
 use crate::resource::discovery::SystemResources;
+use crate::resource::health::GpuMonitor;
 use crate::resource::pool::ResourcePool;
 use crate::scheduler;
 use crate::store::RunStore;
@@ -31,6 +32,7 @@ pub struct DaemonState {
     pub nodes:       Vec<Node>,                // nodes.yaml order = first-fit order
     pub pools:       Mutex<Vec<ResourcePool>>, // same index as nodes
     pub resources:   SystemResources,          // this machine's inventory, reported by Info
+    pub gpu_monitor: GpuMonitor,               // this machine's GPU readings, reported by Info
     pub worker:      Worker,                   // runs jobs for controllers that use this machine as a node
     pub store:       RunStore,
     pub events:      SpmcSubscriber<JobEvent>, // Sync, Clone - IPC handlers call .subscribe()
@@ -49,6 +51,7 @@ impl DaemonState {
             nodes,
             pools:       Mutex::new(pools),
             resources,
+            gpu_monitor: GpuMonitor::open(),
             worker:      Worker::default(),
             store,
             events,

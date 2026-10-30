@@ -406,7 +406,9 @@ fn print_info(info: &NodeInfo) {
         println!("gpu     none");
     }
     for gpu in &info.resources.gpus {
-        println!("gpu {:<3} {}, {} MB", gpu.index, gpu.name, gpu.vram_mb);
+        let health = info.gpu_health.iter().find(|health| health.index == gpu.index);
+        println!("gpu {:<3} {}, {} MB{}", gpu.index, gpu.name, gpu.vram_mb,
+                 health.map(|health| health.to_string()).unwrap_or_default());
     }
 }
 
@@ -447,6 +449,8 @@ fn print_node(status: &NodeStatus) {
         println!("gpu     none");
     }
     for (gpu, free) in status.total.gpus.iter().zip(&status.free_vram_mb) {
-        println!("gpu {:<3} {}, {}/{} MB free", gpu.index, gpu.name, free, gpu.vram_mb);
+        let health = status.gpu_health.iter().find(|health| health.index == gpu.index);
+        println!("gpu {:<3} {}, {}/{} MB free{}", gpu.index, gpu.name, free, gpu.vram_mb,
+                 health.map(|health| health.to_string()).unwrap_or_default());
     }
 }
