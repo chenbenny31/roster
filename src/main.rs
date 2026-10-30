@@ -450,7 +450,9 @@ fn print_node(status: &NodeStatus) {
     }
     for (gpu, free) in status.total.gpus.iter().zip(&status.free_vram_mb) {
         let health = status.gpu_health.iter().find(|health| health.index == gpu.index);
-        println!("gpu {:<3} {}, {}/{} MB free{}", gpu.index, gpu.name, free, gpu.vram_mb,
-                 health.map(|health| health.to_string()).unwrap_or_default());
+        let outside = *free == gpu.vram_mb && health.is_some_and(|health| health.busy());
+        println!("gpu {:<3} {}, {}/{} MB free{}{}", gpu.index, gpu.name, free, gpu.vram_mb,
+                 health.map(|health| health.to_string()).unwrap_or_default(),
+                 if outside { ", in use outside roster" } else { "" });
     }
 }

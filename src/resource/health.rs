@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "nvml")]
-use nvml_wrapper::{bitmasks::device::ThrottleReasons, enum_wrappers::device::TemperatureSensor};
+use nvml_wrapper::{bitmasks::device::ThrottleReasons, enum_wrappers::device::TemperatureSensor, enums::device::UsedGpuMemory};
 
 use crate::resource::discovery::GpuInfo;
 
@@ -19,6 +19,21 @@ pub struct GpuHealth {
     pub used_vram_mb:  Option<u64>, // measured, unlike the pool's booked VRAM
     pub busy_percent:  Option<u32>,
     pub throttled:     Vec<String>, // why clocks are held down: "thermal", "power", "hardware"; empty when not
+    #[serde(default)]
+    pub processes:       Option<u32>, // compute processes on the card, from any user or program
+    #[serde(default)]
+    pub process_vram_mb: Option<u64>, // VRAM those processes hold together
+}
+
+/// Compute processes holding less than this together don't make a card busy: desktop apps such as
+/// a GTK terminal show up as compute processes with a few hundred MB
+pub const BUSY_VRAM_MB: u64 = 1024;
+
+impl GpuHealth {
+    /// Whether processes on the card hold enough VRAM to keep a job off it
+    pub fn busy(&self) -> bool {
+        self.process_vram_mb.unwrap_or(0) >= BUSY_VRAM_MB
+    }
 }
 
 /// NVML kept open for the daemon's life
@@ -43,6 +58,7 @@ impl GpuMonitor {
         if let Some(nvml) = &self.nvml {
             return gpus.iter().filter_map(|gpu| {
                 let device = nvml.device_by_index(gpu.index).ok()?;
+                let processes = device.running_compute_processes().ok();
                 Some(GpuHealth {
                     index:         gpu.index,
                     temperature_c: device.temperature(TemperatureSensor::Gpu).ok(),
@@ -51,6 +67,11 @@ impl GpuMonitor {
                     used_vram_mb:  device.memory_info().ok().map(|memory| memory.used / 1024 / 1024),
                     busy_percent:  device.utilization_rates().ok().map(|rates| rates.gpu),
                     throttled:     device.current_throttle_reasons().map(throttle_names).unwrap_or_default(),
+                    processes:       processes.as_ref().map(|list| list.len() as u32),
+                    process_vram_mb: processes.as_ref().map(|list| list.iter().map(|process| match process.used_gpu_memory {
+                        UsedGpuMemory::Used(bytes) => bytes / 1024 / 1024,
+                        UsedGpuMemory::Unavailable => 0,
+                    }).sum()),
                 })
             }).collect();
         }
@@ -94,6 +115,12 @@ impl fmt::Display for GpuHealth {
         if !self.throttled.is_empty() {
             write!(f, ", throttled: {}", self.throttled.join(", "))?;
         }
+        let vram = self.process_vram_mb.unwrap_or(0);
+        match self.processes {
+            Some(1) => write!(f, ", 1 process ({} MB)", vram)?,
+            Some(count) if count > 1 => write!(f, ", {} processes ({} MB)", count, vram)?,
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -109,11 +136,20 @@ mod tests {
         let full = GpuHealth {
             index: 0, temperature_c: Some(52), power_w: Some(41), power_limit_w: Some(300),
             used_vram_mb: Some(1200), busy_percent: Some(3), throttled: vec!["thermal".into()],
+            processes: Some(2), process_vram_mb: Some(1100),
         };
-        assert_eq!(full.to_string(), ", 52 C, 41/300 W, 3% busy, 1200 MB used, throttled: thermal");
+        assert_eq!(full.to_string(), ", 52 C, 41/300 W, 3% busy, 1200 MB used, throttled: thermal, 2 processes (1100 MB)");
 
         let partial = GpuHealth { index: 1, temperature_c: Some(40), ..Default::default() };
         assert_eq!(partial.to_string(), ", 40 C");
+    }
+
+    #[test]
+    fn a_desktop_app_does_not_make_a_card_busy() {
+        let terminal = GpuHealth { processes: Some(1), process_vram_mb: Some(376), ..Default::default() };
+        assert!(!terminal.busy());
+        let leftover = GpuHealth { processes: Some(2), process_vram_mb: Some(6_000), ..Default::default() };
+        assert!(leftover.busy());
     }
 
     #[cfg(feature = "nvml")]
