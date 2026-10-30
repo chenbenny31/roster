@@ -57,6 +57,10 @@ impl GpuHealth {
         if unbooked && !self.throttled.is_empty() {
             return Some(format!("throttled while idle: {}", self.throttled.join(", ")));
         }
+        // a card gets work only after it passed qualification since its node's daemon started
+        if unbooked && self.tested_at.is_none() {
+            return Some("not qualified yet".into());
+        }
         None
     }
 }
@@ -256,6 +260,11 @@ mod tests {
         let hot = GpuHealth { throttled: vec!["thermal".into()], ..Default::default() };
         assert!(hot.blocked(false).is_none()); // a job running on it heats it up
         assert_eq!(hot.blocked(true).as_deref(), Some("throttled while idle: thermal"));
+        let untested = GpuHealth::default();
+        assert_eq!(untested.blocked(true).as_deref(), Some("not qualified yet"));
+        assert!(untested.blocked(false).is_none()); // a job taken back after a restart keeps its card
+        let tested = GpuHealth { tested_at: Some(Utc::now()), ..Default::default() };
+        assert!(tested.blocked(true).is_none());
     }
 
     #[cfg(feature = "nvml")]

@@ -121,8 +121,8 @@ async fn check_gpus(state: &Arc<DaemonState>, checks: &mut GpuChecks) {
     let mut readings = Vec::new();
     for node in &state.nodes {
         readings.push(match &node.ssh {
-            None => state.gpu_monitor.read(&state.resources.gpus),
-            Some(_) => node.health().await.info.map(|info| info.gpu_health).unwrap_or_default(),
+            None => Some(state.gpu_monitor.read(&state.resources.gpus)),
+            Some(_) => node.health().await.info.map(|info| info.gpu_health), // None until its first health check
         });
     }
 
@@ -132,6 +132,12 @@ async fn check_gpus(state: &Arc<DaemonState>, checks: &mut GpuChecks) {
         let mut requalify = state.requalify.lock().unwrap();
         for (index, (node, reading)) in state.nodes.iter().zip(readings).enumerate() {
             let pool = &mut pools[index];
+            // an offline node gets no work anyway; until a reading arrives, at startup or once it is back,
+            // its cards wait, since a node daemon that just started hasn't qualified them yet
+            let Some(reading) = reading.filter(|_| node.is_online()) else {
+                pool.blocked.fill(true);
+                continue;
+            };
             for gpu in pool.total.gpus.clone() {
                 let health = reading.iter().find(|health| health.index == gpu.index);
                 let unbooked = pool.available_vram_mb[gpu.index as usize] == gpu.vram_mb;
