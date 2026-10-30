@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 
 use crate::workflow::model::JobInstance;
@@ -14,15 +16,24 @@ pub struct JobHandle {
 }
 
 impl JobHandle {
-    /// Construct a handle for a host process (ShellExecutor); `scope` is the systemd scope holding it, if any
-    pub(crate) fn process(host_pid: u32, scope: Option<String>) -> Self {
-        Self { host_pid, backend: Backend::Process { scope } }
+    /// Construct a handle for a host process (ShellExecutor); `scope` is the systemd scope holding it and
+    /// `exit_file` where its wrapper writes the exit code, both None without systemd
+    pub(crate) fn process(host_pid: u32, scope: Option<String>, exit_file: Option<PathBuf>) -> Self {
+        Self { host_pid, backend: Backend::Process { scope, exit_file } }
+    }
+
+    /// Where the job's wrapper writes its exit code, if it runs in a scope
+    pub(crate) fn exit_file(&self) -> Option<&PathBuf> {
+        match &self.backend {
+            Backend::Process { exit_file, .. } => exit_file.as_ref(),
+            _ => None,
+        }
     }
 
     /// The systemd scope unit holding a local job's processes, if it runs in one
     pub(crate) fn scope(&self) -> Option<&str> {
         match &self.backend {
-            Backend::Process { scope } => scope.as_deref(),
+            Backend::Process { scope, .. } => scope.as_deref(),
             _ => None,
         }
     }
@@ -37,7 +48,7 @@ impl JobHandle {
 /// Concrete executor produced a handle and specific identity to operate job later
 #[derive(Debug, Clone)]
 enum Backend {
-    Process { scope: Option<String> }, // the scope is a cgroup holding the job and everything it starts
+    Process { scope: Option<String>, exit_file: Option<PathBuf> }, // the scope is a cgroup holding the job and everything it starts
     #[allow(dead_code)]
     Container(String),
     Remote { run_id: String, job_id: String }, // the node's name for the execution

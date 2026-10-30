@@ -5,7 +5,23 @@
 use std::ffi::{c_void, CStr};
 use std::ptr::null_mut;
 
-/// An integer hash chain per thread, and a fill and a check pass over a VRAM buffer
+/// An integer hash chain per thread, and a fill and a check pass over a VRAM buffer; in CUDA C++:
+///
+/// ```cuda
+/// __global__ void hash(unsigned* out, unsigned rounds) {
+///     unsigned index = blockIdx.x * blockDim.x + threadIdx.x, x = index;
+///     for (unsigned i = 0; i < rounds; i++) { x = x * 1664525u + 1013904223u; x ^= x >> 13; }
+///     out[index] = x;
+/// }
+/// __global__ void fill(unsigned* buffer, unsigned long long words, unsigned seed) {
+///     for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < words; i += gridDim.x * blockDim.x)
+///         buffer[i] = (unsigned)i * 1664525u ^ seed;
+/// }
+/// __global__ void check(const unsigned* buffer, unsigned long long words, unsigned seed, unsigned* errors) {
+///     for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < words; i += gridDim.x * blockDim.x)
+///         if (buffer[i] != ((unsigned)i * 1664525u ^ seed)) atomicAdd(errors, 1);
+/// }
+/// ```
 const PTX: &CStr = c"
 .version 7.0
 .target sm_50

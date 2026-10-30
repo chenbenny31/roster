@@ -11,9 +11,9 @@ use crate::resource::pool::Allocation;
 use crate::workflow::model::JobInstance;
 use crate::workflow::spec::JobSpec;
 
-/// The process this node started for one job, and its exit code once known
+/// The job this node started, and its exit code once known
 struct JobProcess {
-    handle:    JobHandle,   // pid of `sh -c <command>`, also its process group
+    handle:    JobHandle,   // its scope and exit file, or without systemd the pid of `sh -c` and its process group
     exit_code: Option<i32>, // kept after exit so a repeated Poll gets the same answer
 }
 
@@ -29,7 +29,8 @@ impl JobProcess {
     }
 }
 
-/// This node's side of the worker operations; processes live in memory until restart
+/// This node's side of the worker operations; a job started before this daemon restarted is found
+/// again through its scope or exit file the first time the controller asks about it
 #[derive(Default)]
 pub struct Worker {
     processes: Mutex<HashMap<(String, String), JobProcess>>, // (run_id, job_id)
@@ -56,7 +57,7 @@ impl Worker {
 
     pub async fn poll(&self, run_id: String, job_id: String) -> Response {
         let mut processes = self.processes.lock().await;
-        let Some(process) = processes.get_mut(&(run_id, job_id)) else {
+        let Some(process) = known(&mut processes, run_id, job_id).await else {
             return Response::Error { message: "unknown execution".into() };
         };
 
@@ -68,7 +69,7 @@ impl Worker {
 
     /// SIGTERM the process group, SIGKILL after 5 s; the exit shows up in the next Poll
     pub async fn kill(&self, run_id: String, job_id: String) -> Response {
-        let handle = match self.processes.lock().await.get(&(run_id, job_id)) {
+        let handle = match known(&mut *self.processes.lock().await, run_id, job_id).await {
             None => return Response::Error { message: "unknown execution".into() },
             Some(process) if process.exit_code.is_some() => return Response::Killed,
             Some(process) => process.handle.clone(),
@@ -92,6 +93,18 @@ impl Worker {
         }
         running
     }
+}
+
+/// The job's process: one this daemon started, or one started before it restarted, found by its scope or exit file
+async fn known(processes: &mut HashMap<(String, String), JobProcess>, run_id: String, job_id: String)
+        -> Option<&mut JobProcess> {
+    let key = (run_id, job_id);
+    if !processes.contains_key(&key) {
+        let handle = ShellExecutor::find(&key.0, &key.1).await?;
+        tracing::info!(run_id = %key.0, job_id = %key.1, "found a job started before this daemon restarted");
+        processes.insert(key.clone(), JobProcess { handle, exit_code: None });
+    }
+    processes.get_mut(&key)
 }
 
 // tests
