@@ -7,7 +7,8 @@ Roster runs your commands on a small pool of Linux machines with GPUs. You submi
 - **One binary per machine.** Every machine runs the same daemon, which finds its own CPUs, memory, and GPUs. `roster node add` registers a machine you already reach over SSH and starts its daemon there. There is no shared filesystem or database server to set up.
 - **One command per job.** `roster run -- python train.py` queues the command as it is. When every node is busy, jobs wait in order and start as soon as resources free up, and a large job can't be starved by a stream of small ones.
 - **Every job visible live.** Each node streams job events and resource use to the controller, so `roster watch` shows which job holds which GPU on which node within milliseconds. A node that goes quiet shows as stale, not idle.
-- **Waiting explained.** `roster explain` reads the scheduler's own decision instead of a reason code.
+- **Waiting and failures explained.** `roster explain` reads the scheduler's own decision instead of a reason code, and a failed job shows the last lines of its log, read on the node that ran it.
+- **Faulty GPUs kept out.** A GPU that reports a hardware fault is set aside and gets work again only after it passes a test: Roster's own kernel check, plus NVIDIA DCGM where it is installed.
 - **Safe handover.** A GPU goes to the next job only after the previous job's processes are verified gone, and a job is never started twice after a crash or a lost message.
 
 Roster is in early development; the [roadmap](#roadmap) shows what works today.
@@ -79,7 +80,7 @@ Child exit, `ECHILD`, a lost heartbeat, or a timeout never count as proof. If cl
 
 **Durable state.** The controller and every worker keep SQLite with WAL and `synchronous=FULL`. Nothing is acknowledged before it commits. A failed write stops new admission and keeps known allocations held. Workers keep their journal on local disk and keep managing their jobs while the controller is down.
 
-**Queue and placement.** There is one FIFO queue. `next` promotes a job, and a bound keeps promoted jobs from starving the oldest waiting one. Placement is first-fit over a fixed node order: the first node that fits the whole request (CPU, RAM, and the full GPU set) wins. A job never combines GPUs from two machines. Placement runs again as soon as a worker reports an exit, so freed resources don't sit idle. An older job that can't fit yet gets a **ticket** on a node, so younger jobs only use spare resources there until it fits. Busy or disconnected nodes mean the job waits; Roster rejects a job only when known capacity could never fit it. `explain` reads the same decision the scheduler made:
+**Queue and placement.** There is one FIFO queue. `next` promotes a job, and a bound keeps promoted jobs from starving the oldest waiting one. Placement is first-fit over a fixed node order: the first node that fits the whole request (CPU, RAM, and the full GPU set) wins. A job never combines GPUs from two machines. Placement runs again as soon as a worker reports an exit, so freed resources don't sit idle. An older job that can't fit yet gets a **ticket** on a node, so younger jobs only use spare resources there until it fits. Busy or disconnected nodes mean the job waits; Roster rejects a job only when known capacity could never fit it. A node that lacks the job's program turns it down before anything starts, and the job goes to another node. It fails only when every node that fits has turned it down, with each node's reason. `explain` reads the same decision the scheduler made:
 
 ```text
 Job 42 is waiting for a GPU.
@@ -88,6 +89,8 @@ Roster will start this job when cleanup is confirmed.
 ```
 
 **Resources.** A requirement ("one GPU with at least 24 GB"), the claim placement makes (that GPU's UUID), and what the backend enforces are kept separate. GPUs start as exclusive whole devices, and `CUDA_VISIBLE_DEVICES` gets their UUIDs. A job asks for a GPU count, a total VRAM, or both. With only VRAM, Roster picks the fewest GPUs on one node (1, 2, 4, or 8, the tensor-parallel sizes) that each hold an even share, and `ROSTER_GPUS` tells the job how many it got.
+
+**GPU health.** Each worker reads its GPUs through NVML. A GPU that reports a hardware Xid or has memory pages waiting for retirement is quarantined by UUID, and the quarantine survives restarts. A quarantined GPU, one busy with work Roster didn't start, and one throttling while idle all stay out of placement. Qualification runs as an ordinary job on the GPU: a kernel test of compute and memory, then DCGM diagnostics where installed. It runs when a node starts, daily on idle GPUs, after a fault, and after a job dies by a signal. Passing ends a quarantine, and `roster gpu clear` ends one by hand.
 
 **Unknown stays unknown.** A disconnected node isn't treated as empty, a missing result isn't success, and uncertain work is never started again elsewhere. After any restart, Roster loads unreleased allocations before computing free capacity and then reconciles each worker. Retries are explicit; Roster re-places a job on its own only when it can prove no execution ever got launch permission.
 
@@ -165,7 +168,7 @@ S5 comes before S4 because multi-node placement matters more than preemption.
 | Stage | Delivers | Status |
 | --- | --- | --- |
 | S0 | Single-node prototype: YAML workflows with dependencies, CPU/RAM/VRAM budgets, first-fit GPU selection, shell processes, SQLite status, locked build | Done |
-| **P1** | **Multi-node prototype ahead of S1–S5: a daemon on every node, `node add`, one queue across nodes, live node streams, `roster run` and `watch`; no launch gate or restart recovery yet** | **Current** |
+| **P1** | **Multi-node prototype ahead of S1–S5: a daemon on every node, `node add`, one queue across nodes, live node streams, `roster run` and `watch`; no launch gate yet** | **Current** |
 | S1 | Job/attempt/execution/allocation model, FIFO with promotion and tickets, first-fit, typed claims, request IDs | Next |
 | S2 | Reliable local execution: runner, launch gate, systemd service, cancel, deadlines, restart recovery | Planned |
 | S3 | GPUs by UUID, exclusive allocation, release checks on real hardware | Planned |
@@ -182,14 +185,15 @@ The current prototype uses its own commands:
 cargo build --locked                 # add --features nvml for NVIDIA discovery and GPU readings
 roster start                         # also stop, restart, info; enable and disable use systemd
 roster node add SSH_ALIAS            # on the controller, then roster restart; also node ls, node rm
-roster info NODE                     # state, running jobs, free resources, GPU temperature and power
+roster info NODE                     # state, running jobs, free resources, GPU readings and health
+roster gpu clear NODE GPU            # end a quarantine by hand
 roster submit examples/cpu-only.yaml
 roster ps
-roster status <run-id>
-roster logs <run-id>/<job-id>
+roster status <run-id>               # job states, and why a job failed or which nodes turned it down
+roster logs <run-id>/<job-id>        # the end of the log, read on the node that ran it
 ```
 
-Each job already runs in its own systemd scope under a memory-capped `roster.slice`, gets whole GPUs, and a GPU busy with work Roster didn't start is skipped until it frees.
+Each job already runs in its own systemd scope under a memory-capped `roster.slice` and gets whole GPUs. GPU health, quarantine, and qualification work as described above. Jobs keep running through a daemon restart, and a restarted controller takes back its unfinished runs.
 
 Shared GPUs are a separate branch after S3, for example an 8 GB and a 2 GB job on one 16 GB card. They need per-job claims and a validated backend (budgets, MPS, or MIG). A memory split says nothing about compute share.
 
