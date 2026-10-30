@@ -21,11 +21,13 @@ pub struct Quarantine {
     pub since:  DateTime<Utc>,
 }
 
-/// What can happen to a card: an Xid, something the startup scan finds, or an operator's clear
+/// What can happen to a card: an Xid, something the startup scan finds, a qualification's
+/// failure, or a clear by a passing qualification or an operator
 #[derive(Debug)]
 pub enum CardEvent {
     Xid(u64),
     PagesPendingRetirement,
+    TestFailed(String),
     Cleared,
 }
 
@@ -37,15 +39,17 @@ impl CardEvent {
             CardEvent::Xid(code) if HARDWARE_XIDS.contains(&code) => format!("Xid {}", code),
             CardEvent::Xid(_) => return current, // usually the job crashed, not the card
             CardEvent::PagesPendingRetirement => "memory pages pending retirement".to_string(),
+            CardEvent::TestFailed(reason) => format!("qualification failed: {}", reason),
         };
         current.or(Some(Quarantine { reason, since: Utc::now() }))
     }
 }
 
-/// Quarantined cards on this machine, saved to a file on every change
+/// Quarantined cards on this machine, saved to a file on every change, and when each was last tested
 pub struct Quarantines {
-    path:  PathBuf,
-    cards: Mutex<HashMap<String, Quarantine>>, // by card UUID
+    path:   PathBuf,
+    cards:  Mutex<HashMap<String, Quarantine>>, // by card UUID
+    tested: Mutex<HashMap<String, DateTime<Utc>>>, // in memory: after a restart every card is tested again
 }
 
 impl Quarantines {
@@ -58,7 +62,7 @@ impl Quarantines {
             }),
             Err(_) => HashMap::new(),
         };
-        Self { path, cards: Mutex::new(cards) }
+        Self { path, cards: Mutex::new(cards), tested: Mutex::new(HashMap::new()) }
     }
 
     /// Apply an event to a card; save and log when its quarantine starts or ends
@@ -73,6 +77,7 @@ impl Quarantines {
             Some(quarantine) => {
                 tracing::warn!(gpu = gpu.index, uuid = %gpu.uuid, reason = %quarantine.reason, "GPU quarantined");
                 cards.insert(key(gpu), quarantine);
+                self.tested.lock().unwrap().remove(&key(gpu)); // a new fault: test it again
             }
             None => {
                 tracing::info!(gpu = gpu.index, uuid = %gpu.uuid, "GPU quarantine cleared");
@@ -86,6 +91,21 @@ impl Quarantines {
 
     pub fn get(&self, gpu: &GpuInfo) -> Option<Quarantine> {
         self.cards.lock().unwrap().get(&key(gpu)).cloned()
+    }
+
+    /// A qualification's result: a pass ends a quarantine, a failure starts one
+    pub fn record_test(&self, gpu: &GpuInfo, passed: bool, reason: String) {
+        if passed {
+            tracing::info!(gpu = gpu.index, uuid = %gpu.uuid, %reason, "GPU qualified");
+            self.handle(gpu, CardEvent::Cleared);
+        } else {
+            self.handle(gpu, CardEvent::TestFailed(reason));
+        }
+        self.tested.lock().unwrap().insert(key(gpu), Utc::now());
+    }
+
+    pub fn tested_at(&self, gpu: &GpuInfo) -> Option<DateTime<Utc>> {
+        self.tested.lock().unwrap().get(&key(gpu)).copied()
     }
 
     /// Through a temp file, so a crash never leaves half a file
@@ -122,6 +142,22 @@ mod tests {
         assert_eq!(quarantine.reason, "Xid 79");
         assert_eq!(CardEvent::Xid(48).apply(Some(quarantine.clone())), Some(quarantine.clone()));
         assert!(CardEvent::Cleared.apply(Some(quarantine)).is_none());
+    }
+
+    #[test]
+    fn a_failed_test_quarantines_and_a_new_fault_asks_for_another() {
+        let path = std::env::temp_dir().join(format!("roster-quarantine-{}.json", uuid::Uuid::new_v4()));
+        let quarantines = Quarantines::load(path.clone());
+        let gpu = card(0, "GPU-aaaa");
+        quarantines.record_test(&gpu, false, "kernel test: 3 of 4096 hash chains wrong".into());
+        assert_eq!(quarantines.get(&gpu).unwrap().reason, "qualification failed: kernel test: 3 of 4096 hash chains wrong");
+        assert!(quarantines.tested_at(&gpu).is_some());
+
+        quarantines.record_test(&gpu, true, "kernel test passed".into());
+        assert!(quarantines.get(&gpu).is_none());
+        quarantines.handle(&gpu, CardEvent::Xid(79));
+        assert!(quarantines.tested_at(&gpu).is_none()); // tested again after the new fault
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

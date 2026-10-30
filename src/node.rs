@@ -46,6 +46,15 @@ pub struct Node {
 }
 
 impl Node {
+    /// Send a request other than a job operation to this node's daemon: through its tunnel,
+    /// or this machine's own socket
+    pub async fn request(&self, request: Request) -> anyhow::Result<Response> {
+        match &self.socket {
+            Some(socket) => client::exchange(UnixStream::connect(socket).await?, request).await,
+            None => client::send(request).await,
+        }
+    }
+
     pub fn is_online(&self) -> bool {
         self.online.load(Ordering::Relaxed)
     }

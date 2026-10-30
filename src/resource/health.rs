@@ -3,6 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "nvml")]
@@ -30,6 +31,8 @@ pub struct GpuHealth {
     pub process_vram_mb: Option<u64>, // VRAM those processes hold together
     #[serde(default)]
     pub quarantined:     Option<String>, // why the card is out of service, until a test passes or `roster gpu clear`
+    #[serde(default)]
+    pub tested_at:       Option<DateTime<Utc>>, // last qualification since this node's daemon started
 }
 
 /// Compute processes holding less than this together don't make a card busy: desktop apps such as
@@ -97,6 +100,7 @@ impl GpuMonitor {
             let mut health = GpuHealth {
                 index:       gpu.index,
                 quarantined: self.quarantines.get(gpu).map(|quarantine| quarantine.reason),
+                tested_at:   self.quarantines.tested_at(gpu),
                 ..Default::default()
             };
             #[cfg(feature = "nvml")]
@@ -121,6 +125,11 @@ impl GpuMonitor {
     /// `roster gpu clear`: put a quarantined card back in service
     pub fn clear(&self, gpu: &GpuInfo) {
         self.quarantines.handle(gpu, CardEvent::Cleared);
+    }
+
+    /// What `roster qualify` reports for one of this machine's cards
+    pub fn record_test(&self, gpu: &GpuInfo, passed: bool, reason: String) {
+        self.quarantines.record_test(gpu, passed, reason);
     }
 }
 
@@ -224,7 +233,7 @@ mod tests {
         let full = GpuHealth {
             index: 0, temperature_c: Some(52), power_w: Some(41), power_limit_w: Some(300),
             used_vram_mb: Some(1200), busy_percent: Some(3), throttled: vec!["thermal".into()],
-            processes: Some(2), process_vram_mb: Some(1100), quarantined: None,
+            processes: Some(2), process_vram_mb: Some(1100), quarantined: None, tested_at: None,
         };
         assert_eq!(full.to_string(), ", 52 C, 41/300 W, 3% busy, 1200 MB used, throttled: thermal, 2 processes (1100 MB)");
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -35,6 +35,7 @@ pub struct DaemonState {
     pub pools:       Mutex<Vec<ResourcePool>>, // same index as nodes
     pub resources:   SystemResources,          // this machine's inventory, reported by Info
     pub gpu_monitor: GpuMonitor,               // this machine's GPU readings, reported by Info
+    pub requalify:   std::sync::Mutex<HashSet<(usize, u32)>>, // (node, GPU) a job on it was killed by a signal
     pub worker:      Worker,                   // runs jobs for controllers that use this machine as a node
     pub store:       RunStore,
     pub events:      SpmcSubscriber<JobEvent>, // Sync, Clone - IPC handlers call .subscribe()
@@ -55,6 +56,7 @@ impl DaemonState {
             pools:       Mutex::new(pools),
             resources,
             gpu_monitor,
+            requalify:   std::sync::Mutex::new(HashSet::new()),
             worker:      Worker::default(),
             store,
             events,

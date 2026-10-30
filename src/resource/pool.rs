@@ -40,6 +40,16 @@ impl ResourcePool {
         }
     }
 
+    /// Book one whole card for roster's own use, such as a qualification; None when it's taken or reports no VRAM
+    pub fn reserve_card(&mut self, index: u32) -> Option<Allocation> {
+        let gpu = self.total.gpus.iter().find(|gpu| gpu.index == index)?;
+        if gpu.vram_mb == 0 || self.available_vram_mb[index as usize] != gpu.vram_mb {
+            return None;
+        }
+        self.available_vram_mb[index as usize] = 0;
+        Some(Allocation { cpu: 0, memory_mb: 0, gpus: vec![GpuAllocation { index, vram_mb: gpu.vram_mb }] })
+    }
+
     /// Read-only admission check, used by `roster status` to explain Queued job
     pub fn can_admit(&self, spec: &ResourceSpec) -> bool {
         self.try_find_gpus(spec).is_some()

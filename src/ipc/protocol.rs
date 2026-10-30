@@ -25,6 +25,7 @@ pub enum Request {
     Info, // this machine's daemon, for `roster info`/`stop`/`node add` and the tunnel health check
     Nodes, // the nodes this daemon places jobs on, for `roster node ls` and `roster info NODE`
     ClearGpu { node: Option<String>, gpu: u32 }, // `roster gpu clear`; a named node gets it with node None
+    GpuQualified { index: u32, passed: bool, reason: String }, // from `roster qualify` to its own daemon
 
     // worker operations, sent by a controller through the node's tunnel
     // an execution is named by (run_id, job_id); one per job for now
@@ -46,6 +47,7 @@ pub enum Response {
     Info(NodeInfo),
     Nodes { nodes: Vec<NodeStatus> },
     GpuCleared,
+    Recorded,
 
     Launched { host_pid: u32 },
     Polled   { exit_code: Option<i32> }, // None while running

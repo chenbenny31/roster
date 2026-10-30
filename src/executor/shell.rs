@@ -62,6 +62,7 @@ impl Executor for ShellExecutor {
             .env("CUDA_DEVICE_ORDER", "PCI_BUS_ID") // number GPUs as NVML does, so the indices name the booked cards
             .env("CUDA_VISIBLE_DEVICES", &gpu_indices)
             .env("ROSTER_GPUS", placement.gpus.len().to_string()) // how many cards it got, e.g. for --tensor-parallel-size
+            .env("ROSTER_BIN", std::env::current_exe().unwrap_or_default()) // this roster, e.g. for `roster qualify`
             .stdout(log_file)
             .stderr(stderr_file);
 

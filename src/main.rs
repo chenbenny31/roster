@@ -73,6 +73,16 @@ enum Command {
         #[command(subcommand)]
         command: GpuCommand,
     },
+    /// Test one GPU and report to this machine's daemon; roster runs it on idle cards
+    #[command(hide = true)]
+    Qualify {
+        #[arg(long)]
+        index: u32,
+        #[arg(long)]
+        uuid: Option<String>,
+        #[arg(long, help = "also run DCGM's longer level 2 diagnostic where installed")]
+        retest: bool,
+    },
     /// Submit a workflow YAML
     Submit {
         #[arg(help = "path to workflow YAML")]
@@ -177,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
                      target, info.resources.cpu_cores, info.resources.memory_mb, info.resources.gpus.len());
         },
         Command::Node { command: NodeCommand::Ls } => list_nodes().await?,
+        Command::Qualify { index, uuid, retest } => roster::resource::qualify::run(index, uuid, retest).await?,
         Command::Gpu { command: GpuCommand::Clear { node, gpu } } => {
             match client::send(Request::ClearGpu { node: Some(node.clone()), gpu }).await? {
                 Response::GpuCleared => println!("GPU {} on {} is back in service", gpu, node),

@@ -9,11 +9,14 @@ use crate::broadcast::SpmcSender;
 use crate::daemon::DaemonState;
 use crate::event::{monotonic_raw_ns, JobEvent};
 use crate::executor::{ExecutorError, JobHandle, PollResult};
+use crate::ipc::protocol::Request;
 use crate::node::Node;
 use crate::paths::{job_log_path, job_log_relpath};
+use crate::resource::discovery::GpuInfo;
 use crate::resource::placement::place;
 use crate::resource::pool::{Allocation, ResourcePool};
 use crate::workflow::model::{Execution, JobInstance, JobState};
+use crate::workflow::spec::JobSpec;
 
 const TICK_MS: u64 = 100;
 
@@ -21,6 +24,12 @@ const TICK_MS: u64 = 100;
 /// one that stays out of placement this long gets a warning
 const GPU_CHECK_TICKS: u64 = 20;
 const GPU_BLOCKED_WARN: Duration = Duration::from_secs(30);
+
+/// Qualification: how often an idle card is tested again, how long a test may take (DCGM's level 2
+/// takes minutes), and how long to wait for the node's readings to show a finished test
+const QUALIFY_EVERY: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+const QUALIFY_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const QUALIFY_SETTLE: Duration = Duration::from_secs(60);
 
 /// Return each execution's allocation to its own node's pool
 fn release(pools: &mut [ResourcePool], executions: &[Execution]) {
@@ -41,21 +50,40 @@ fn log_path(node: &Node, run_id: &str, job_id: &str) -> PathBuf {
 /// owns the SpmcSender - the single writer to the event ring buffer
 pub async fn run(state: Arc<DaemonState>, event_sender: SpmcSender<JobEvent>) {
     let mut ticker = interval(Duration::from_millis(TICK_MS));
-    let mut blocked_since = HashMap::new();
+    let mut checks = GpuChecks::default();
     for count in 0u64.. {
         ticker.tick().await;
         if count % GPU_CHECK_TICKS == 0 {
-            check_gpus(&state, &mut blocked_since).await;
+            check_gpus(&state, &mut checks).await;
         }
         tick(&state, &event_sender).await;
     }
 }
 
+/// What the 2 s GPU check carries from one run to the next
+#[derive(Default)]
+struct GpuChecks {
+    blocked_since:  HashMap<(usize, u32), (Instant, bool)>, // when a card was first seen blocked, warned yet
+    qualifying:     Vec<Qualification>,
+    last_qualified: HashMap<(usize, u32), Instant>, // so a reading the node hasn't updated yet starts no second run
+}
+
+/// `roster qualify` running as an internal job that holds a whole card
+struct Qualification {
+    node:       usize,
+    gpu:        u32,
+    allocation: Allocation,
+    handle:     JobHandle,
+    started:    Instant,
+}
+
 /// Keep cards out of placement for as long as `GpuHealth::blocked` gives a reason: quarantined by
 /// their node, or, with nothing booked, busy with processes roster didn't start or throttled;
 /// readings come from each node's last health check, or NVML on this machine
-/// `blocked_since` holds when each blocked card was first seen and whether it was warned about
-async fn check_gpus(state: &Arc<DaemonState>, blocked_since: &mut HashMap<(usize, u32), (Instant, bool)>) {
+/// then qualify idle cards that need it
+async fn check_gpus(state: &Arc<DaemonState>, checks: &mut GpuChecks) {
+    finish_qualifications(state, checks).await;
+
     // read before taking the pools lock
     let mut readings = Vec::new();
     for node in &state.nodes {
@@ -65,30 +93,111 @@ async fn check_gpus(state: &Arc<DaemonState>, blocked_since: &mut HashMap<(usize
         });
     }
 
-    let mut pools = state.pools.lock().await;
-    for (index, (node, reading)) in state.nodes.iter().zip(readings).enumerate() {
-        let pool = &mut pools[index];
-        for gpu in &pool.total.gpus {
-            let health = reading.iter().find(|health| health.index == gpu.index);
-            let unbooked = pool.available_vram_mb[gpu.index as usize] == gpu.vram_mb;
-            let reason = health.and_then(|health| health.blocked(unbooked));
-            pool.blocked[gpu.index as usize] = reason.is_some();
+    let mut to_qualify = Vec::new();
+    {
+        let mut pools = state.pools.lock().await;
+        let mut requalify = state.requalify.lock().unwrap();
+        for (index, (node, reading)) in state.nodes.iter().zip(readings).enumerate() {
+            let pool = &mut pools[index];
+            for gpu in pool.total.gpus.clone() {
+                let health = reading.iter().find(|health| health.index == gpu.index);
+                let unbooked = pool.available_vram_mb[gpu.index as usize] == gpu.vram_mb;
+                let reason = health.and_then(|health| health.blocked(unbooked));
+                pool.blocked[gpu.index as usize] = reason.is_some();
 
-            let key = (index, gpu.index);
-            match reason {
-                Some(reason) => {
-                    let (since, warned) = blocked_since.entry(key).or_insert((Instant::now(), false));
-                    if !*warned && since.elapsed() >= GPU_BLOCKED_WARN {
-                        tracing::warn!(node = %node.name, gpu = gpu.index, %reason, "GPU not handed out");
-                        *warned = true;
+                let key = (index, gpu.index);
+                match reason {
+                    Some(reason) => {
+                        let (since, warned) = checks.blocked_since.entry(key).or_insert((Instant::now(), false));
+                        if !*warned && since.elapsed() >= GPU_BLOCKED_WARN {
+                            tracing::warn!(node = %node.name, gpu = gpu.index, %reason, "GPU not handed out");
+                            *warned = true;
+                        }
+                    }
+                    None => {
+                        if let Some((_, true)) = checks.blocked_since.remove(&key) {
+                            tracing::info!(node = %node.name, gpu = gpu.index, "GPU free again");
+                        }
                     }
                 }
-                None => {
-                    if let Some((_, true)) = blocked_since.remove(&key) {
-                        tracing::info!(node = %node.name, gpu = gpu.index, "GPU free again");
+
+                // an idle card, untested since its node started, a day ago, after a new fault,
+                // or after a job on it was killed; a quarantined card is tested again too
+                let Some(health) = health else { continue };
+                let due = requalify.contains(&key)
+                    || health.tested_at.is_none_or(|tested| Utc::now() - tested > QUALIFY_EVERY);
+                let recent = checks.last_qualified.get(&key).is_some_and(|last| last.elapsed() < QUALIFY_SETTLE);
+                let idle = !health.busy() && health.throttled.is_empty();
+                if due && !recent && idle && node.is_online() {
+                    if let Some(allocation) = pool.reserve_card(gpu.index) {
+                        requalify.remove(&key);
+                        to_qualify.push((index, gpu, health.quarantined.is_some(), allocation));
                     }
                 }
             }
+        }
+    } // locks released before launching
+
+    for (node, gpu, retest, allocation) in to_qualify {
+        checks.last_qualified.insert((node, gpu.index), Instant::now());
+        match start_qualification(state, node, &gpu, retest, &allocation).await {
+            Some(handle) => checks.qualifying.push(Qualification { node, gpu: gpu.index, allocation, handle, started: Instant::now() }),
+            None => state.pools.lock().await[node].release(&allocation),
+        }
+    }
+}
+
+/// Launch `roster qualify` on the node, holding the card; `retest` asks for DCGM's level 2 where installed
+async fn start_qualification(state: &Arc<DaemonState>, node: usize, gpu: &GpuInfo, retest: bool, allocation: &Allocation)
+        -> Option<JobHandle> {
+    let mut command = format!("\"$ROSTER_BIN\" qualify --index {}", gpu.index);
+    if !gpu.uuid.is_empty() {
+        command.push_str(&format!(" --uuid {}", gpu.uuid));
+    }
+    if retest {
+        command.push_str(" --retest");
+    }
+    let job = JobInstance::new(JobSpec { id: format!("gpu{}", gpu.index), command, ..Default::default() }, 0);
+    let run_id = format!("qualify-{}", uuid::Uuid::new_v4().simple());
+
+    let name = &state.nodes[node].name;
+    match state.nodes[node].executor.launch(&run_id, &job, allocation).await {
+        Ok(handle) => {
+            tracing::info!(node = %name, gpu = gpu.index, retest, %run_id, "qualifying GPU");
+            Some(handle)
+        }
+        Err(error) => {
+            tracing::warn!(node = %name, gpu = gpu.index, %error, "could not start GPU qualification");
+            None
+        }
+    }
+}
+
+/// Release the cards of qualifications that ended; one past its timeout is stopped and counts
+/// as a failure, since a hung test is no pass; the node records the result either way
+async fn finish_qualifications(state: &Arc<DaemonState>, checks: &mut GpuChecks) {
+    let mut ended = Vec::new();
+    for qualification in std::mem::take(&mut checks.qualifying) {
+        let node = &state.nodes[qualification.node];
+        match node.executor.poll(&qualification.handle).await {
+            Ok(PollResult::Running) if qualification.started.elapsed() > QUALIFY_TIMEOUT => {
+                let _ = node.executor.cancel(&qualification.handle).await;
+                let reason = format!("no result within {} minutes", QUALIFY_TIMEOUT.as_secs() / 60);
+                let request = Request::GpuQualified { index: qualification.gpu, passed: false, reason };
+                if let Err(error) = node.request(request).await {
+                    tracing::warn!(node = %node.name, gpu = qualification.gpu, %error, "could not report a timed-out qualification");
+                }
+                ended.push(qualification);
+            }
+            // still running, or the node can't be asked now: keep holding the card
+            Ok(PollResult::Running) | Err(ExecutorError::Unreachable(_)) => checks.qualifying.push(qualification),
+            Ok(PollResult::Exited { .. }) | Err(_) => ended.push(qualification),
+        }
+    }
+    if !ended.is_empty() {
+        let mut pools = state.pools.lock().await;
+        for qualification in &ended {
+            pools[qualification.node].release(&qualification.allocation);
         }
     }
 }
@@ -389,7 +498,15 @@ async fn advance_running(state: &Arc<DaemonState>, event_sender: &SpmcSender<Job
                 }
                 Ok(PollResult::Running) => {} // no change
                 Ok(PollResult::Exited { exit_code }) => {
-                    release(&mut pools, &std::mem::take(&mut job.executions));
+                    let executions = std::mem::take(&mut job.executions);
+                    // killed by a signal it wasn't sent by a cancel, e.g. the GPU faulted: test its cards
+                    if exit_code == -1 && !entry.cancelling {
+                        let mut requalify = state.requalify.lock().unwrap();
+                        for execution in &executions {
+                            requalify.extend(execution.allocation.gpus.iter().map(|gpu| (execution.node, gpu.index)));
+                        }
+                    }
+                    release(&mut pools, &executions);
 
                     job.exit_code = Some(exit_code);
                     job.ended_at  = Some(Utc::now());

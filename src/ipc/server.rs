@@ -8,7 +8,6 @@ use tokio::time::timeout;
 
 use crate::daemon::DaemonState;
 use crate::executor::JobHandle;
-use crate::ipc::client;
 use crate::ipc::protocol::{JobDetail, NodeInfo, NodeStatus, RunDetail, RunSummary, Request, Response};
 use crate::paths::socket_path;
 use crate::workflow::dag;
@@ -165,13 +164,9 @@ async fn handle_clear_gpu(state: Arc<DaemonState>, node: Option<String>, gpu: u3
         let Some(target) = state.nodes.iter().find(|candidate| candidate.name == name) else {
             return Response::Error { message: format!("no node '{}', see `roster node ls`", name) };
         };
-        if let Some(socket) = &target.socket {
-            let request = Request::ClearGpu { node: None, gpu };
-            return match UnixStream::connect(socket).await {
-                Ok(stream) => client::exchange(stream, request).await
-                    .unwrap_or_else(|error| Response::Error { message: format!("node '{}': {}", name, error) }),
-                Err(error) => Response::Error { message: format!("node '{}' unreachable: {}", name, error) },
-            };
+        if target.socket.is_some() {
+            return target.request(Request::ClearGpu { node: None, gpu }).await
+                .unwrap_or_else(|error| Response::Error { message: format!("node '{}': {}", name, error) });
         }
     }
     match state.resources.gpus.iter().find(|card| card.index == gpu) {
@@ -247,6 +242,13 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
         Request::Info => handle_info(state).await,
         Request::Nodes => handle_nodes(state).await,
         Request::ClearGpu { node, gpu } => handle_clear_gpu(state, node, gpu).await,
+        Request::GpuQualified { index, passed, reason } => match state.resources.gpus.iter().find(|card| card.index == index) {
+            Some(card) => {
+                state.gpu_monitor.record_test(card, passed, reason);
+                Response::Recorded
+            }
+            None => Response::Error { message: format!("no GPU {} on this machine", index) },
+        },
         Request::Launch { run_id, job, allocation } => state.worker.launch(run_id, job, allocation).await,
         Request::Poll { run_id, job_id } => state.worker.poll(run_id, job_id).await,
         Request::Kill { run_id, job_id } => state.worker.kill(run_id, job_id).await,
