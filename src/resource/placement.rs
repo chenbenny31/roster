@@ -8,11 +8,14 @@ pub fn place(pools: &mut [ResourcePool], online: &[bool], members: &[ResourceSpe
     let mut placed: Vec<(usize, Allocation)> = Vec::new();
 
     for spec in members {
+        // a job that gives only VRAM tries 1, 2, 4, then 8 cards, each over every node, so the fewest cards win
         // try_reserve leaves a pool unchanged when it returns None
-        let found = pools.iter_mut()
-            .enumerate()
-            .filter(|(node, _)| online[*node])
-            .find_map(|(node, pool)| pool.try_reserve(spec).map(|alloc| (node, alloc)));
+        let found = spec.gpu_options().iter().find_map(|option| {
+            pools.iter_mut()
+                .enumerate()
+                .filter(|(node, _)| online[*node])
+                .find_map(|(node, pool)| pool.try_reserve(option).map(|alloc| (node, alloc)))
+        });
 
         match found {
             Some(member) => placed.push(member),
@@ -66,6 +69,18 @@ mod tests {
     fn gpus_never_combine_across_nodes() {
         let mut pools = vec![node(8, &[16_000]), node(8, &[16_000])];
         assert!(place(&mut pools, &[true, true], &[spec(1, 2)]).is_none());
+    }
+
+    #[test]
+    fn vram_only_job_takes_the_fewest_cards() {
+        let mut pools = vec![node(8, &[24_000, 24_000]), node(8, &[80_000])];
+        let online = [true, true];
+        let serve = ResourceSpec { cpu: 1, memory_mb: 512, gpu: 0, vram_mb: 40_000 };
+        let first = place(&mut pools, &online, &[serve.clone()]).unwrap();
+        assert_eq!((first[0].0, first[0].1.gpus.len()), (1, 1)); // one card on node 1 beats two on node 0
+        let second = place(&mut pools, &online, &[serve.clone()]).unwrap();
+        assert_eq!((second[0].0, second[0].1.gpus.len()), (0, 2)); // then two 24 GB cards, 20 GB each
+        assert!(place(&mut pools, &online, &[serve]).is_none());
     }
 
     #[test]

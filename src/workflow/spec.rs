@@ -33,7 +33,7 @@ pub struct ResourceSpec {
     #[serde(default)]
     pub gpu: u32, // number of GPUs requires, 0 = CPU-only
     #[serde(default)]
-    pub vram_mb: u64, // per-GPU VRAM requirement in MB, 0 if no GPU
+    pub vram_mb: u64, // VRAM the job needs across its GPUs, in MB; each whole GPU holds an even share, 0 = any card
 }
 
 impl Default for ResourceSpec {
@@ -44,6 +44,26 @@ impl Default for ResourceSpec {
             gpu: 0,
             vram_mb: 0,
         }
+    }
+}
+
+/// Card counts tried for a job that gives only VRAM: tensor parallelism splits a model evenly,
+/// and serving engines need the count to divide the model's attention heads
+const GPU_COUNTS: [u32; 4] = [1, 2, 4, 8];
+
+impl ResourceSpec {
+    /// The requests to try, fewest cards first: the job's own, or for a job that gives only VRAM
+    /// the same request on 1, 2, 4 and 8 cards
+    pub fn gpu_options(&self) -> Vec<ResourceSpec> {
+        if self.gpu > 0 || self.vram_mb == 0 {
+            return vec![self.clone()];
+        }
+        GPU_COUNTS.iter().map(|&gpu| ResourceSpec { gpu, ..self.clone() }).collect()
+    }
+
+    /// Each card's even share of the job's VRAM; 0 when it asks for no GPU
+    pub fn vram_per_gpu(&self) -> u64 {
+        if self.gpu == 0 { 0 } else { self.vram_mb.div_ceil(self.gpu as u64) }
     }
 }
 

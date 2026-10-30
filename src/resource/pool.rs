@@ -11,7 +11,7 @@ pub struct Allocation {
     pub gpus:      Vec<GpuAllocation>, // empty for CPU-only jobs
 }
 
-/// A single GPU slow within an allocation, records index and VRAM reserved
+/// One whole GPU within an allocation: its index and all of its VRAM
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuAllocation {
     pub index:   u32,
@@ -49,7 +49,7 @@ impl ResourcePool {
     pub fn could_fit(&self, spec: &ResourceSpec) -> bool {
         let matching_gpus = self.total.gpus
             .iter()
-            .filter(|gpu| gpu.vram_mb >= spec.vram_mb)
+            .filter(|gpu| gpu.vram_mb > 0 && gpu.vram_mb >= spec.vram_per_gpu())
             .count();
 
         self.total.cpu_cores >= spec.cpu
@@ -99,6 +99,8 @@ impl ResourcePool {
     }
 
     /// First-fit GPU selection, find lowest indices with enough free VRAM, else return None
+    /// Whole GPUs, first-fit by index, never shared: a card is free when none of its VRAM is booked,
+    /// and each must hold its even share of the job's VRAM; cards that report no VRAM are never handed out
     fn try_find_gpus(&self, spec: &ResourceSpec) -> Option<Vec<GpuAllocation>> {
         if spec.gpu == 0 {
             return Some(vec![]);
@@ -106,9 +108,10 @@ impl ResourcePool {
 
         let selected: Vec<GpuAllocation> = self.total.gpus
             .iter()
-            .filter(|gpu| self.available_vram_mb[gpu.index as usize] >= spec.vram_mb)
+            .filter(|gpu| gpu.vram_mb > 0 && self.available_vram_mb[gpu.index as usize] == gpu.vram_mb)
+            .filter(|gpu| gpu.vram_mb >= spec.vram_per_gpu())
             .take(spec.gpu as usize)
-            .map(|gpu| GpuAllocation { index: gpu.index, vram_mb: spec.vram_mb })
+            .map(|gpu| GpuAllocation { index: gpu.index, vram_mb: gpu.vram_mb }) // the whole card
             .collect();
 
         if selected.len() == spec.gpu as usize {
@@ -175,6 +178,24 @@ mod tests {
     }
 
     #[test]
+    fn a_gpu_is_never_shared_even_without_vram() {
+        let mut pool = make_pool(16, 32_000, vec![gpu(0, 16_000)]);
+        let alloc = pool.try_reserve(&gpu_spec(1, 512, 1, 0)).unwrap();
+        assert_eq!(alloc.gpus[0].vram_mb, 16_000); // the whole card
+        assert!(pool.try_reserve(&gpu_spec(1, 512, 1, 0)).is_none());
+        pool.release(&alloc);
+        assert!(pool.try_reserve(&gpu_spec(1, 512, 1, 0)).is_some());
+    }
+
+    #[test]
+    fn each_gpu_holds_an_even_share_of_vram() {
+        let mut pool = make_pool(16, 32_000, vec![gpu(0, 8_000), gpu(1, 16_000), gpu(2, 16_000)]);
+        assert!(pool.try_reserve(&gpu_spec(1, 512, 2, 40_000)).is_none()); // 20 GB each, no card has it
+        let alloc = pool.try_reserve(&gpu_spec(1, 512, 2, 24_000)).unwrap(); // 12 GB each
+        assert_eq!(alloc.gpus.iter().map(|gpu| gpu.index).collect::<Vec<_>>(), vec![1, 2]); // GPU 0 too small
+    }
+
+    #[test]
     fn release_restores_resources() {
         let mut pool  = make_pool(16, 32_000, vec![gpu(0, 16_000)]);
         let alloc = pool.try_reserve(&gpu_spec(4, 8_000, 1, 12_000)).unwrap();
@@ -198,7 +219,7 @@ mod tests {
         let mut pool = make_pool(4, 8_000, vec![gpu(0, 8_000), gpu(1, 16_000)]);
         pool.try_reserve(&gpu_spec(4, 8_000, 1, 16_000)).unwrap();
         assert!(pool.could_fit(&gpu_spec(4, 8_000, 1, 16_000))); // busy now, fits later
-        assert!(!pool.could_fit(&gpu_spec(1, 1_000, 2, 12_000))); // only one GPU has 12 GB
+        assert!(!pool.could_fit(&gpu_spec(1, 1_000, 2, 24_000))); // 12 GB each, only one GPU has that
         assert!(!pool.could_fit(&cpu_spec(8, 1_000)));
     }
 }

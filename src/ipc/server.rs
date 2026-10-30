@@ -77,7 +77,8 @@ async fn handle_submit(spec_yaml: String, state: Arc<DaemonState>) -> Response {
     {
         let pools = state.pools.lock().await;
         for job in &spec.jobs {
-            if !pools.iter().any(|pool| pool.could_fit(&job.resources)) {
+            let options = job.resources.gpu_options();
+            if !pools.iter().any(|pool| options.iter().any(|option| pool.could_fit(option))) {
                 return Response::Error {
                     message: format!("job '{}' does not fit on any node: {:?}", job.id, job.resources),
                 };
