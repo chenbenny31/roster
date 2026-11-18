@@ -1,6 +1,6 @@
 use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context};
@@ -341,8 +341,11 @@ async fn wait_for_daemon(mut child: Option<std::process::Child>, log: &str) -> a
 /// replaces a daemon started by `roster start`; without --resources an existing unit is kept,
 /// so `node add` never changes a node's declared inventory
 async fn enable(resources: Option<PathBuf>) -> anyhow::Result<()> {
-    run("loginctl", &["enable-linger"])
-        .context("run `sudo loginctl enable-linger $USER` once, then `roster enable` again")?;
+    // enabling linger takes polkit, which servers often lack, so only ask when it is off
+    if !linger_enabled() {
+        run("loginctl", &["enable-linger"])
+            .context("run `sudo loginctl enable-linger $USER` once, then `roster enable` again")?;
+    }
 
     let path = unit_path();
     let enabled = path.exists();
@@ -391,6 +394,11 @@ async fn disable(force: bool) -> anyhow::Result<()> {
     run("systemctl", &["--user", "daemon-reload"])?;
     println!("disabled");
     Ok(())
+}
+
+/// logind keeps a file per user whose services run without a login
+fn linger_enabled() -> bool {
+    std::env::var("USER").is_ok_and(|user| Path::new("/var/lib/systemd/linger").join(user).exists())
 }
 
 /// Run a command to completion, failing with its error output
