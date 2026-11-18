@@ -23,7 +23,7 @@ use crate::node::Node;
 use crate::paths::db_path;
 use crate::paths::{pid_path, socket_path};
 use crate::resource::discovery::SystemResources;
-use crate::resource::health::GpuMonitor;
+use crate::resource::health::{GpuHealth, GpuMonitor};
 use crate::resource::pool::ResourcePool;
 use crate::scheduler;
 use crate::store::RunStore;
@@ -67,6 +67,25 @@ impl DaemonState {
         });
         (state, sender)
     }
+
+    /// Where this machine's own cards are booked: its entry in nodes.yaml, the only one without ssh;
+    /// None when this daemon places nothing here
+    pub fn local_node(&self) -> Option<usize> {
+        self.nodes.iter().position(|node| node.ssh.is_none())
+    }
+
+    /// This machine's GPU readings, each naming who holds the card here: what Info reports to controllers
+    /// and this daemon's scheduler checks
+    pub async fn gpu_readings(&self) -> Vec<GpuHealth> {
+        let mut readings = self.gpu_monitor.read(&self.resources.gpus);
+        if let Some(local) = self.local_node() {
+            let pools = self.pools.lock().await;
+            for health in &mut readings {
+                health.held_by = pools[local].holders.get(health.index as usize).cloned().flatten();
+            }
+        }
+        readings
+    }
 }
 
 /// Entry point for `roster start --foreground`
@@ -81,6 +100,7 @@ pub async fn run(resources: SystemResources, nodes: Vec<Node>, pools: Vec<Resour
     tracing::info!(path = %db_path().display(), "databased opened");
     let (state, event_sender) = DaemonState::new(resources, nodes, pools, store);
     recover::take_back_runs(&state).await?;
+    crate::worker::take_back_holds(&state).await?;
 
     let result = tokio::select! {
         r = listen(state.clone()) => r,

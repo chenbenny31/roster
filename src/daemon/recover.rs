@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use crate::daemon::DaemonState;
 use crate::executor::shell::ShellExecutor;
 use crate::executor::JobHandle;
-use crate::resource::pool::Allocation;
+use crate::resource::pool::{Allocation, Holder};
 use crate::store::{JobRow, SavedJob};
 use crate::workflow::model::{Execution, JobInstance, JobState, WorkflowRun};
 use crate::workflow::spec::WorkflowSpec;
@@ -46,7 +46,7 @@ pub async fn take_back_runs(state: &Arc<DaemonState>) -> anyhow::Result<()> {
             }
             match reattach(state, &saved.run_id, saved_job).await {
                 Some(execution) => {
-                    pools[execution.node].book(&execution.allocation);
+                    pools[execution.node].book(&Holder::new(&saved.run_id, &job.job_id), &execution.allocation);
                     tracing::info!(run_id = %saved.run_id, job_id = %job.job_id, node = %state.nodes[execution.node].name,
                                    "took back a running job");
                     job.executions = vec![execution];

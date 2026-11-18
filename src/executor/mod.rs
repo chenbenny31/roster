@@ -90,6 +90,10 @@ pub enum ExecutorError {
     /// The node turned the job down before starting it, e.g. its program isn't there; another node may run it
     #[error("rejected: {0}")]
     Rejected(String),
+
+    /// The node holds one of the cards for another job; unlike Rejected, the job may go there later
+    #[error("busy: {0}")]
+    Busy(String),
 }
 
 /// Trait for job executors, MVP implements ShellExecutor

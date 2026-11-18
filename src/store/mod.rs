@@ -3,6 +3,7 @@ use chrono::Utc;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Row, SqlitePool};
 
+use crate::resource::pool::{Allocation, Holder};
 use crate::workflow::model::{derive_run_state, JobInstance, JobState, WorkflowRun};
 
 /// A run whose jobs hadn't all ended when the daemon stopped
@@ -87,6 +88,18 @@ impl RunStore {
         .execute(&pool)
         .await?;
 
+        // a controller's job or card test on this machine and what it holds, until it ends here
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS holds (
+                run_id     TEXT NOT NULL,
+                job_id     TEXT NOT NULL,
+                allocation TEXT NOT NULL,
+                PRIMARY KEY (run_id, job_id)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
         // columns added later: a run's spec, and a running job's node and allocation, so a restarted
         // controller can take the run back; which nodes turned a job down, or why it failed without running
         for (table, column) in [("runs", "spec_json"), ("jobs", "node"), ("jobs", "allocation"), ("jobs", "reason")] {
@@ -138,6 +151,37 @@ impl RunStore {
         .await?;
 
         Ok(())
+    }
+
+    /// Keep what a controller's job holds on this machine, so a restarted daemon books it again
+    pub async fn save_hold(&self, holder: &Holder, allocation: &Allocation) -> anyhow::Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO holds (run_id, job_id, allocation) VALUES (?, ?, ?)")
+            .bind(&holder.run_id)
+            .bind(&holder.job_id)
+            .bind(serde_json::to_string(allocation)?)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn drop_hold(&self, holder: &Holder) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM holds WHERE run_id = ? AND job_id = ?")
+            .bind(&holder.run_id)
+            .bind(&holder.job_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// What controllers' jobs held here when the daemon stopped; a row that no longer parses is skipped
+    pub async fn holds(&self) -> anyhow::Result<Vec<(Holder, Allocation)>> {
+        let rows = sqlx::query("SELECT run_id, job_id, allocation FROM holds")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().filter_map(|row| {
+            let allocation = serde_json::from_str(row.get::<&str, _>("allocation")).ok()?;
+            Some((Holder::new(row.get("run_id"), row.get("job_id")), allocation))
+        }).collect())
     }
 
     /// A job that can't be taken back after a restart ends as Interrupted
@@ -351,7 +395,7 @@ impl RunAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::pool::{Allocation, GpuAllocation};
+    use crate::resource::pool::GpuAllocation;
     use crate::workflow::model::Execution;
     use crate::workflow::spec::{self, WorkflowSpec};
 
@@ -383,6 +427,22 @@ mod tests {
 
         store.interrupt("run-1", "train").await.unwrap();
         assert!(store.unfinished_runs().await.unwrap().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_hold_is_kept_until_dropped() {
+        let path = std::env::temp_dir().join(format!("roster-store-{}.db", uuid::Uuid::new_v4()));
+        let store = RunStore::open(&path).await.unwrap();
+        let holder = Holder::new("run-1", "train");
+        let allocation = Allocation { cpu: 1, memory_mb: 512, gpus: vec![GpuAllocation { index: 3, vram_mb: 8_192 }] };
+        store.save_hold(&holder, &allocation).await.unwrap();
+        store.save_hold(&holder, &allocation).await.unwrap(); // the same launch again
+        let holds = store.holds().await.unwrap();
+        assert_eq!(holds.len(), 1);
+        assert_eq!((&holds[0].0, holds[0].1.gpus[0].index), (&holder, 3));
+        store.drop_hold(&holder).await.unwrap();
+        assert!(store.holds().await.unwrap().is_empty());
         std::fs::remove_file(&path).ok();
     }
 

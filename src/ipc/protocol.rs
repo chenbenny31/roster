@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::discovery::SystemResources;
 use crate::resource::health::GpuHealth;
-use crate::resource::pool::Allocation;
+use crate::resource::pool::{Allocation, Holder};
 use crate::workflow::spec::JobSpec;
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -51,6 +51,7 @@ pub enum Response {
 
     Launched { host_pid: u32 },
     Rejected { reason: String },         // the node won't run this job; the controller tries another node
+    Busy     { reason: String },         // a card asked for is held here by another job; the job may come back later
     Polled   { exit_code: Option<i32> }, // None while running
     Killed,
 }
@@ -81,7 +82,7 @@ pub struct NodeStatus {
     pub total:          SystemResources,
     pub free_cpu:       u32,
     pub free_memory_mb: u64,
-    pub free_vram_mb:   Vec<u64>,       // per GPU, same order as total.gpus
+    pub holders:        Vec<Option<Holder>>, // per GPU, same order as total.gpus: the job or card test it is booked for
     pub gpu_health:     Vec<GpuHealth>, // from the node's last health check; empty without NVML
 }
 

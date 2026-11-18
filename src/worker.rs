@@ -4,10 +4,11 @@ use std::collections::HashMap;
 
 use tokio::sync::Mutex;
 
+use crate::daemon::DaemonState;
 use crate::executor::shell::ShellExecutor;
 use crate::executor::{Executor, ExecutorError, JobHandle, PollResult};
 use crate::ipc::protocol::Response;
-use crate::resource::pool::Allocation;
+use crate::resource::pool::{Allocation, Holder};
 use crate::workflow::model::JobInstance;
 use crate::workflow::spec::JobSpec;
 
@@ -90,6 +91,25 @@ impl Worker {
         }
     }
 
+    /// The jobs started here that have exited, by id
+    pub async fn ended(&self) -> Vec<Holder> {
+        let mut processes = self.processes.lock().await;
+        let mut ended = Vec::new();
+        for ((run_id, job_id), process) in processes.iter_mut() {
+            if matches!(process.exit_code().await, Ok(Some(_))) {
+                ended.push(Holder::new(run_id, job_id));
+            }
+        }
+        ended
+    }
+
+    /// A job found again after this daemon restarted, so its exit is seen without a controller asking
+    pub async fn adopt(&self, holder: &Holder, handle: JobHandle) {
+        self.processes.lock().await
+            .entry((holder.run_id.clone(), holder.job_id.clone()))
+            .or_insert(JobProcess { handle, exit_code: None });
+    }
+
     /// Processes started here that have not exited, for `roster info` and `roster stop`
     /// a process that can't be checked counts as running
     pub async fn running(&self) -> usize {
@@ -102,6 +122,67 @@ impl Worker {
         }
         running
     }
+}
+
+/// A controller's job or card test on this machine: book its cards here under its id, so this machine's own
+/// scheduler and other controllers see them, then start it; a card another id holds answers Busy, after
+/// giving back the cards of jobs that already ended
+pub async fn book_and_launch(state: &DaemonState, run_id: String, job: JobSpec, allocation: Allocation) -> Response {
+    let Some(local) = state.local_node() else {
+        return state.worker.launch(run_id, job, allocation).await; // nothing here books this machine's cards
+    };
+    let holder = Holder::new(&run_id, &job.id);
+    let mut booked = state.pools.lock().await[local].try_book(&holder, &allocation);
+    if booked.is_err() {
+        free_ended(state).await; // the job holding it may have just ended
+        booked = state.pools.lock().await[local].try_book(&holder, &allocation);
+    }
+    if let Err((gpu, other)) = booked {
+        return Response::Busy { reason: format!("GPU {} is held by {}", gpu, other) };
+    }
+    if let Err(error) = state.store.save_hold(&holder, &allocation).await {
+        tracing::warn!(%holder, %error, "could not save what a job holds; a restart here would forget it");
+    }
+
+    let response = state.worker.launch(run_id, job, allocation).await;
+    if !matches!(response, Response::Launched { .. }) {
+        unbook(state, local, &holder).await;
+    }
+    response
+}
+
+/// Give back here the cards of controllers' jobs that ended; every 2 s, and when a launch finds a card held
+pub async fn free_ended(state: &DaemonState) {
+    let Some(local) = state.local_node() else { return };
+    for holder in state.worker.ended().await {
+        if state.pools.lock().await[local].holds(&holder) {
+            unbook(state, local, &holder).await;
+        }
+    }
+}
+
+async fn unbook(state: &DaemonState, local: usize, holder: &Holder) {
+    state.pools.lock().await[local].release(holder);
+    if let Err(error) = state.store.drop_hold(holder).await {
+        tracing::warn!(%holder, %error, "could not forget what an ended job held");
+    }
+}
+
+/// After a restart, before the scheduler or a launch can hand them out: book again the cards of
+/// controllers' jobs still here, running or ended while the daemon was down; one that left nothing is forgotten
+pub async fn take_back_holds(state: &DaemonState) -> anyhow::Result<()> {
+    let Some(local) = state.local_node() else { return Ok(()) };
+    for (holder, allocation) in state.store.holds().await? {
+        match ShellExecutor::find(&holder.run_id, &holder.job_id).await {
+            Some(handle) => {
+                state.worker.adopt(&holder, handle).await;
+                state.pools.lock().await[local].book(&holder, &allocation);
+                tracing::info!(%holder, "took back what a controller's job holds here");
+            }
+            None => state.store.drop_hold(&holder).await?,
+        }
+    }
+    Ok(())
 }
 
 /// The job's process: one this daemon started, or one started before it restarted, found by its scope or exit file
@@ -149,6 +230,24 @@ mod tests {
         assert_eq!(exit_code, 3);
         assert!(matches!(worker.poll(run_id.clone(), "exit3".into()).await, Response::Polled { exit_code: Some(3) }));
         assert!(matches!(worker.poll(run_id, "missing".into()).await, Response::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn ended_lists_jobs_that_exited() {
+        let worker = Worker::default();
+        let run_id = format!("worker-test-{}", uuid::Uuid::new_v4());
+        let quick = JobSpec { id: "quick".into(), command: "true".into(), ..Default::default() };
+        let slow = JobSpec { id: "slow".into(), command: "sleep 30".into(), ..Default::default() };
+        worker.launch(run_id.clone(), quick, allocation()).await;
+        worker.launch(run_id.clone(), slow, allocation()).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while worker.ended().await.is_empty() && tokio::time::Instant::now() < deadline {
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(worker.ended().await, vec![Holder::new(&run_id, "quick")]);
+        worker.kill(run_id.clone(), "slow".into()).await;
+        assert_eq!(worker.ended().await.len(), 2);
     }
 
     #[tokio::test]

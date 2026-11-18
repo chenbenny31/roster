@@ -454,7 +454,9 @@ fn print_info(info: &NodeInfo) {
     for gpu in &info.resources.gpus {
         let health = info.gpu_health.iter().find(|health| health.index == gpu.index);
         let quarantined = health.and_then(|health| health.quarantined.as_ref());
-        println!("gpu {:<3} {}, {} MB{}{}", gpu.index, gpu.name, gpu.vram_mb,
+        let held = health.and_then(|health| health.held_by.as_ref());
+        println!("gpu {:<3} {}, {} MB{}{}{}", gpu.index, gpu.name, gpu.vram_mb,
+                 held.map(|holder| format!(", held by {}", holder)).unwrap_or_default(),
                  health.map(|health| health.to_string()).unwrap_or_default(),
                  quarantined.map(|reason| format!(", quarantined: {}", reason)).unwrap_or_default());
     }
@@ -496,10 +498,11 @@ fn print_node(status: &NodeStatus) {
     if status.total.gpus.is_empty() {
         println!("gpu     none");
     }
-    for (gpu, free) in status.total.gpus.iter().zip(&status.free_vram_mb) {
+    for (gpu, holder) in status.total.gpus.iter().zip(&status.holders) {
         let health = status.gpu_health.iter().find(|health| health.index == gpu.index);
-        let blocked = health.and_then(|health| health.blocked(*free == gpu.vram_mb));
-        println!("gpu {:<3} {}, {}/{} MB free{}{}", gpu.index, gpu.name, free, gpu.vram_mb,
+        let blocked = health.and_then(|health| health.blocked(holder.as_ref()));
+        let booked = holder.as_ref().map_or("free".to_string(), |holder| format!("held by {}", holder));
+        println!("gpu {:<3} {}, {} MB, {}{}{}", gpu.index, gpu.name, gpu.vram_mb, booked,
                  health.map(|health| health.to_string()).unwrap_or_default(),
                  blocked.map(|reason| format!(", not handed out: {}", reason)).unwrap_or_default());
     }

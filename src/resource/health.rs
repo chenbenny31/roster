@@ -13,6 +13,7 @@ use nvml_wrapper::{bitmasks::event::EventTypes, enums::event::XidError, error::N
 
 use crate::paths::quarantine_path;
 use crate::resource::discovery::GpuInfo;
+use crate::resource::pool::Holder;
 use crate::resource::quarantine::{CardEvent, Quarantines};
 
 /// One GPU's readings at the moment of asking; a reading the GPU does not report stays None
@@ -33,6 +34,8 @@ pub struct GpuHealth {
     pub quarantined:     Option<String>, // why the card is out of service, until a test passes or `roster gpu clear`
     #[serde(default)]
     pub tested_at:       Option<DateTime<Utc>>, // last qualification since this node's daemon started
+    #[serde(default)]
+    pub held_by:         Option<Holder>, // the job or card test the node booked the card for; None when free there
 }
 
 /// Compute processes holding less than this together don't make a card busy: desktop apps such as
@@ -45,12 +48,17 @@ impl GpuHealth {
         self.process_vram_mb.unwrap_or(0) >= BUSY_VRAM_MB
     }
 
-    /// Why a job may not get this card now: quarantined, or, while nothing is booked on it,
-    /// busy with processes roster didn't start or held down for heat or power
-    pub fn blocked(&self, unbooked: bool) -> Option<String> {
+    /// Why a job may not get this card now, given who this daemon booked it for: quarantined; held on its node
+    /// by another id; or, while nobody holds it, busy with processes roster didn't start, held down for heat
+    /// or power, or untested
+    pub fn blocked(&self, holder: Option<&Holder>) -> Option<String> {
         if let Some(reason) = &self.quarantined {
             return Some(format!("quarantined: {}", reason));
         }
+        if let Some(other) = self.held_by.as_ref().filter(|other| Some(*other) != holder) {
+            return Some(format!("held on the node by {}", other));
+        }
+        let unbooked = holder.is_none();
         if unbooked && self.busy() {
             return Some(format!("busy outside roster ({} MB)", self.process_vram_mb.unwrap_or(0)));
         }
@@ -237,7 +245,7 @@ mod tests {
         let full = GpuHealth {
             index: 0, temperature_c: Some(52), power_w: Some(41), power_limit_w: Some(300),
             used_vram_mb: Some(1200), busy_percent: Some(3), throttled: vec!["thermal".into()],
-            processes: Some(2), process_vram_mb: Some(1100), quarantined: None, tested_at: None,
+            processes: Some(2), process_vram_mb: Some(1100), quarantined: None, tested_at: None, held_by: None,
         };
         assert_eq!(full.to_string(), ", 52 C, 41/300 W, 3% busy, 1200 MB used, throttled: thermal, 2 processes (1100 MB)");
 
@@ -255,16 +263,32 @@ mod tests {
 
     #[test]
     fn blocked_says_why_a_card_is_not_handed_out() {
+        let train = Holder::new("run-1", "train");
+        let booked = Some(&train);
         let quarantined = GpuHealth { quarantined: Some("Xid 48".into()), ..Default::default() };
-        assert_eq!(quarantined.blocked(false).as_deref(), Some("quarantined: Xid 48")); // even while booked
+        assert_eq!(quarantined.blocked(booked).as_deref(), Some("quarantined: Xid 48")); // even while booked
         let hot = GpuHealth { throttled: vec!["thermal".into()], ..Default::default() };
-        assert!(hot.blocked(false).is_none()); // a job running on it heats it up
-        assert_eq!(hot.blocked(true).as_deref(), Some("throttled while idle: thermal"));
+        assert!(hot.blocked(booked).is_none()); // a job running on it heats it up
+        assert_eq!(hot.blocked(None).as_deref(), Some("throttled while idle: thermal"));
         let untested = GpuHealth::default();
-        assert_eq!(untested.blocked(true).as_deref(), Some("not qualified yet"));
-        assert!(untested.blocked(false).is_none()); // a job taken back after a restart keeps its card
+        assert_eq!(untested.blocked(None).as_deref(), Some("not qualified yet"));
+        assert!(untested.blocked(booked).is_none()); // a job taken back after a restart keeps its card
         let tested = GpuHealth { tested_at: Some(Utc::now()), ..Default::default() };
-        assert!(tested.blocked(true).is_none());
+        assert!(tested.blocked(None).is_none());
+    }
+
+    #[test]
+    fn a_card_held_on_its_node_by_another_id_is_blocked() {
+        let train = Holder::new("run-1", "train");
+        let test = Holder::new("qualify-1", "gpu0");
+        let tested_at = Some(Utc::now());
+        let theirs = GpuHealth { held_by: Some(test.clone()), tested_at, ..Default::default() };
+        assert_eq!(theirs.blocked(None).as_deref(), Some("held on the node by qualify-1/gpu0"));
+        assert_eq!(theirs.blocked(Some(&train)).as_deref(), Some("held on the node by qualify-1/gpu0"));
+        let ours = GpuHealth { held_by: Some(train.clone()), process_vram_mb: Some(6_000), ..Default::default() };
+        assert!(ours.blocked(Some(&train)).is_none()); // our job's VRAM, on a card booked here and there
+        let freed = GpuHealth { tested_at, ..Default::default() };
+        assert!(freed.blocked(Some(&train)).is_none()); // ended on the node, not yet seen here
     }
 
     #[cfg(feature = "nvml")]

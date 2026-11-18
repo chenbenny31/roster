@@ -142,7 +142,7 @@ async fn handle_info(state: Arc<DaemonState>) -> Response {
         running_jobs: controlled + state.worker.running().await,
         jobs_survive_restart: crate::executor::shell::scopes_available(),
         resources:    state.resources.clone(),
-        gpu_health:   state.gpu_monitor.read(&state.resources.gpus),
+        gpu_health:   state.gpu_readings().await,
     })
 }
 
@@ -153,7 +153,7 @@ async fn handle_nodes(state: Arc<DaemonState>) -> Response {
     for node in &state.nodes {
         let node_health = node.health().await;
         let gpu_health = match &node.ssh {
-            None => state.gpu_monitor.read(&state.resources.gpus),
+            None => state.gpu_readings().await,
             Some(_) => node_health.info.as_ref().map(|info| info.gpu_health.clone()).unwrap_or_default(),
         };
         health.push((node_health, gpu_health));
@@ -178,7 +178,7 @@ async fn handle_nodes(state: Arc<DaemonState>) -> Response {
             total:          pool.total.clone(),
             free_cpu:       pool.available_cpu,
             free_memory_mb: pool.available_memory_mb,
-            free_vram_mb:   pool.available_vram_mb.clone(),
+            holders:        pool.holders.clone(),
             gpu_health,
         }
     }).collect();
@@ -261,7 +261,7 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
             }
             None => Response::Error { message: format!("no GPU {} on this machine", index) },
         },
-        Request::Launch { run_id, job, allocation } => state.worker.launch(run_id, job, allocation).await,
+        Request::Launch { run_id, job, allocation } => crate::worker::book_and_launch(&state, run_id, job, allocation).await,
         Request::Poll { run_id, job_id } => state.worker.poll(run_id, job_id).await,
         Request::Kill { run_id, job_id } => state.worker.kill(run_id, job_id).await,
         Request::LogTail { run_id, job_id, bytes } => state.worker.tail(run_id, job_id, bytes).await,
