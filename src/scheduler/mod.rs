@@ -26,9 +26,10 @@ const TICK_MS: u64 = 100;
 const GPU_CHECK_TICKS: u64 = 20;
 const GPU_BLOCKED_WARN: Duration = Duration::from_secs(30);
 
-/// Qualification: how often an idle card is tested again, how long a test may take (DCGM's level 2
-/// takes minutes), and how long to wait for the node's readings to show a finished test
-const QUALIFY_EVERY: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+/// Qualification: how often an idle card is tested again unless `roster start --qualify-every` says,
+/// how long a test may take (DCGM's level 2 takes minutes), and how long to wait for the node's
+/// readings to show a finished test
+pub const QUALIFY_EVERY: chrono::TimeDelta = chrono::TimeDelta::hours(24);
 const QUALIFY_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const QUALIFY_SETTLE: Duration = Duration::from_secs(60);
 
@@ -81,9 +82,10 @@ pub fn log_path(node: &Node, run_id: &str, job_id: &str) -> PathBuf {
 
 /// Run the scheduler loop alongside the IPC listener, return only process exits
 /// owns the SpmcSender - the single writer to the event ring buffer
-pub async fn run(state: Arc<DaemonState>, event_sender: SpmcSender<JobEvent>) {
+/// `qualify_every` is how long after its last test an idle card is tested again
+pub async fn run(state: Arc<DaemonState>, event_sender: SpmcSender<JobEvent>, qualify_every: chrono::TimeDelta) {
     let mut ticker = interval(Duration::from_millis(TICK_MS));
-    let mut checks = GpuChecks::default();
+    let mut checks = GpuChecks { qualify_every, ..Default::default() };
     for count in 0u64.. {
         ticker.tick().await;
         if count % GPU_CHECK_TICKS == 0 {
@@ -96,6 +98,7 @@ pub async fn run(state: Arc<DaemonState>, event_sender: SpmcSender<JobEvent>) {
 /// What the 2 s GPU check carries from one run to the next
 #[derive(Default)]
 struct GpuChecks {
+    qualify_every:  chrono::TimeDelta, // how long after its last test an idle card is tested again
     blocked_since:  HashMap<(usize, u32), (Instant, bool)>, // when a card was first seen blocked, warned yet
     qualifying:     Vec<Qualification>,
     last_qualified: HashMap<(usize, u32), Instant>, // so a reading the node hasn't updated yet starts no second run
@@ -161,11 +164,11 @@ async fn check_gpus(state: &Arc<DaemonState>, checks: &mut GpuChecks) {
                     }
                 }
 
-                // an idle card, untested since its node started, a day ago, after a new fault,
+                // an idle card, untested since its node started, for qualify_every, after a new fault,
                 // or after a job on it was killed; a quarantined card is tested again too
                 let Some(health) = health else { continue };
                 let due = requalify.contains(&key)
-                    || health.tested_at.is_none_or(|tested| Utc::now() - tested > QUALIFY_EVERY);
+                    || health.tested_at.is_none_or(|tested| Utc::now() - tested > checks.qualify_every);
                 let recent = checks.last_qualified.get(&key).is_some_and(|last| last.elapsed() < QUALIFY_SETTLE);
                 let idle = health.held_by.is_none() && !health.busy() && health.throttled.is_empty();
                 if due && !recent && idle && node.is_online() {

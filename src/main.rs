@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context};
-use chrono::Local;
+use chrono::{Local, TimeDelta};
 use clap::{Parser, Subcommand};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -17,6 +17,7 @@ use roster::ipc::protocol::{NodeInfo, NodeStatus, Request, Response};
 use roster::node;
 use roster::paths::{daemon_log_path, nodes_path, socket_path, unit_path};
 use roster::resource::discovery::{self, SystemResources};
+use roster::scheduler::QUALIFY_EVERY;
 
 #[derive(Parser)]
 #[command(name = "roster", about = "GPU-aware workflow scheduler")]
@@ -31,6 +32,8 @@ enum Command {
     Start {
         #[arg(long, help = "declared inventory (YAML or JSON) instead of discovering this machine's")]
         resources: Option<PathBuf>,
+        #[arg(long, value_parser = parse_period, help = QUALIFY_EVERY_HELP)]
+        qualify_every: Option<TimeDelta>,
         #[arg(long, help = "run in this process, e.g. under systemd or in a container")]
         foreground: bool,
     },
@@ -43,6 +46,8 @@ enum Command {
     Restart {
         #[arg(long, help = "declared inventory (YAML or JSON) instead of discovering this machine's")]
         resources: Option<PathBuf>,
+        #[arg(long, value_parser = parse_period, help = QUALIFY_EVERY_HELP)]
+        qualify_every: Option<TimeDelta>,
         #[arg(long, help = "restart anyway; running jobs keep running untracked")]
         force: bool,
     },
@@ -107,6 +112,9 @@ enum Command {
     },
 }
 
+const QUALIFY_EVERY_HELP: &str = "test idle GPUs again this long after their last test, e.g. 10m [default: 24h]; \
+    a controller's applies to its nodes' GPUs";
+
 #[derive(Subcommand)]
 enum NodeCommand {
     /// Start roster on a machine you reach over ssh and add it; takes effect on `roster restart`
@@ -146,22 +154,23 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Start { resources, foreground: true } => {
+        Command::Start { resources, qualify_every, foreground: true } => {
             // before opening tunnels, which would take over a running daemon's tunnel sockets
             if let Some(info) = daemon_info().await? {
                 bail!("a daemon is already running here (pid {})", info.pid);
             }
             let resources = load_resources(resources)?;
             let (nodes, pools) = node::connect(node::load(&nodes_path())?, &resources).await?;
-            roster::daemon::run(resources, nodes, pools).await?;
+            roster::daemon::run(resources, nodes, pools, qualify_every.unwrap_or(QUALIFY_EVERY)).await?;
         },
-        Command::Start { resources, foreground: false } => start(resources).await?,
+        Command::Start { resources, qualify_every, foreground: false } => start(resources, qualify_every).await?,
         Command::Enable { resources } => enable(resources).await?,
         Command::Disable { force } => disable(force).await?,
         Command::Stop { force } => stop(force).await?,
-        Command::Restart { resources, force } => {
+        Command::Restart { resources, qualify_every, force } => {
+            refuse_flags_under_systemd(&resources, &qualify_every)?; // before stopping, so a refusal leaves it running
             stop(force).await?;
-            start(resources).await?;
+            start(resources, qualify_every).await?;
         },
         Command::Info { node: None, json } => {
             let info = daemon_info().await?
@@ -264,15 +273,13 @@ async fn daemon_info() -> anyhow::Result<Option<NodeInfo>> {
 /// Run this binary again as `start --foreground` in a new session, logging to daemon.log,
 /// and return once it answers; a daemon already running counts as started
 /// once enabled, systemd starts it instead
-async fn start(resources: Option<PathBuf>) -> anyhow::Result<()> {
+async fn start(resources: Option<PathBuf>, qualify_every: Option<TimeDelta>) -> anyhow::Result<()> {
     if let Some(info) = daemon_info().await? {
         println!("already running (pid {})", info.pid);
         return Ok(());
     }
+    refuse_flags_under_systemd(&resources, &qualify_every)?;
     if unit_path().exists() {
-        if resources.is_some() {
-            bail!("the daemon runs under systemd; change its inventory with `roster enable --resources FILE`");
-        }
         run("systemctl", &["--user", "start", "roster"])?;
         let info = wait_for_daemon(None, JOURNAL).await?;
         println!("started (pid {}), log `{}`", info.pid, JOURNAL);
@@ -290,6 +297,9 @@ async fn start(resources: Option<PathBuf>) -> anyhow::Result<()> {
     command.args(["start", "--foreground"]);
     if let Some(path) = &resources {
         command.arg("--resources").arg(path);
+    }
+    if let Some(every) = qualify_every {
+        command.arg("--qualify-every").arg(format!("{}s", every.num_seconds()));
     }
     if std::env::var_os("RUST_LOG").is_none() {
         command.env("RUST_LOG", "info"); // node and shutdown events belong in the log
@@ -311,6 +321,20 @@ async fn start(resources: Option<PathBuf>) -> anyhow::Result<()> {
     let log = log_path.display().to_string();
     let info = wait_for_daemon(Some(child), &log).await?;
     println!("started (pid {}), log {}", info.pid, log);
+    Ok(())
+}
+
+/// Under systemd the daemon starts as its unit says, so `start` and `restart` flags can't apply
+fn refuse_flags_under_systemd(resources: &Option<PathBuf>, qualify_every: &Option<TimeDelta>) -> anyhow::Result<()> {
+    if !unit_path().exists() {
+        return Ok(());
+    }
+    if resources.is_some() {
+        bail!("the daemon runs under systemd; change its inventory with `roster enable --resources FILE`");
+    }
+    if qualify_every.is_some() {
+        bail!("the daemon runs under systemd, which starts it without --qualify-every; `roster disable` first");
+    }
     Ok(())
 }
 
@@ -394,6 +418,19 @@ async fn disable(force: bool) -> anyhow::Result<()> {
     run("systemctl", &["--user", "daemon-reload"])?;
     println!("disabled");
     Ok(())
+}
+
+/// A period such as 90s, 10m, 24h or 7d: a whole number above zero and one unit
+fn parse_period(text: &str) -> Result<TimeDelta, String> {
+    let invalid = || format!("'{}' is not a period such as 90s, 10m, 24h or 7d", text);
+    let (number, unit_seconds) = [("s", 1), ("m", 60), ("h", 3600), ("d", 86400)].into_iter()
+        .find_map(|(unit, seconds)| text.strip_suffix(unit).map(|number| (number, seconds)))
+        .ok_or_else(invalid)?;
+    number.parse::<i64>().ok()
+        .filter(|number| *number > 0)
+        .and_then(|number| number.checked_mul(unit_seconds))
+        .and_then(TimeDelta::try_seconds)
+        .ok_or_else(invalid)
 }
 
 /// logind keeps a file per user whose services run without a login
@@ -505,5 +542,21 @@ fn print_node(status: &NodeStatus) {
         println!("gpu {:<3} {}, {} MB, {}{}{}", gpu.index, gpu.name, gpu.vram_mb, booked,
                  health.map(|health| health.to_string()).unwrap_or_default(),
                  blocked.map(|reason| format!(", not handed out: {}", reason)).unwrap_or_default());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_period_is_a_whole_number_and_one_unit() {
+        assert_eq!(parse_period("90s"), Ok(TimeDelta::seconds(90)));
+        assert_eq!(parse_period("10m"), Ok(TimeDelta::minutes(10)));
+        assert_eq!(parse_period("24h"), Ok(TimeDelta::hours(24)));
+        assert_eq!(parse_period("7d"), Ok(TimeDelta::days(7)));
+        for bad in ["", "10", "m", "0m", "-5m", "1.5h", "10 m", "10x", "99999999999999999d"] {
+            assert!(parse_period(bad).is_err(), "{:?} parsed", bad);
+        }
     }
 }

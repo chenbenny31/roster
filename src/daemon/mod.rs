@@ -90,8 +90,10 @@ impl DaemonState {
 
 /// Entry point for `roster start --foreground`
 /// enforce single instance, write PID file, bind socket, run until signal
-/// `resources` is this machine's inventory, `nodes` and `pools` what the scheduler places on
-pub async fn run(resources: SystemResources, nodes: Vec<Node>, pools: Vec<ResourcePool>) -> anyhow::Result<()> {
+/// `resources` is this machine's inventory, `nodes` and `pools` what the scheduler places on,
+/// `qualify_every` how long after its last test an idle card is tested again
+pub async fn run(resources: SystemResources, nodes: Vec<Node>, pools: Vec<ResourcePool>,
+                 qualify_every: chrono::TimeDelta) -> anyhow::Result<()> {
     let _pid_lock = lock_pid_file(&pid_path())?; // held until run returns
     cleanup_stale_socket();
     crate::executor::shell::limit_jobs(resources.memory_mb);
@@ -104,7 +106,7 @@ pub async fn run(resources: SystemResources, nodes: Vec<Node>, pools: Vec<Resour
 
     let result = tokio::select! {
         r = listen(state.clone()) => r,
-        _ = scheduler::run(state.clone(), event_sender) => Ok(()),
+        _ = scheduler::run(state.clone(), event_sender, qualify_every) => Ok(()),
     };
     cleanup();
     result
